@@ -124,7 +124,8 @@ fn main() {
             let mut iev = InputEvent::default();
             let rb = unsafe { read(dev.fd, &mut iev as *mut _ as *mut u8, ev_size) };
             if rb != ev_size as isize {
-                if (rb < 0 && get_errno() != EAGAIN) || fd_hup { disconnected = true; }
+                // rb == 0 (EOF / device gone), rb < 0 with non-EAGAIN error, or HUP → disconnect
+                if rb == 0 || fd_hup || (rb < 0 && get_errno() != EAGAIN) { disconnected = true; }
                 break;
             }
             unsafe {
