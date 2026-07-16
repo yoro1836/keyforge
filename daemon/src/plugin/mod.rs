@@ -152,9 +152,8 @@ pub fn load_plugins(
         metas.push(meta);
     }
     let m = Manifest { plugins: metas.clone() };
-    if let Ok(json) = serde_json::to_string_pretty(&m) {
-        if let Err(e) = fs::write(PLUGIN_MANIFEST, &json) { eprintln!("keyforge: manifest write error: {}", e); }
-    }
+    if let Ok(json) = serde_json::to_string_pretty(&m)
+        && let Err(e) = fs::write(PLUGIN_MANIFEST, &json) { eprintln!("keyforge: manifest write error: {}", e); }
     eprintln!("keyforge: {} plugins loaded", metas.len());
     metas
 }

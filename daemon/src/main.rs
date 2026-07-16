@@ -5,13 +5,21 @@ mod plugin;
 
 use config::Config;
 use core::*;
-use pipeline::{Event, Pipeline, Side};
+use pipeline::{EmitEvent, Event, Pipeline, Side};
 use mlua::Lua;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// Shared processing context: pipeline, config values, uinput fd, pending releases.
+struct ProcCtx<'a> {
+    pipeline: &'a Pipeline,
+    values: &'a HashMap<String, String>,
+    ufd: i32,
+    pending: &'a mut Vec<(Instant, EmitEvent)>,
+}
 
 fn main() {
     let mut config_path = "/sdcard/.keyforge/keyforge.conf".to_string();
@@ -28,16 +36,16 @@ fn main() {
     let _ = plugin::load_plugins(lua, &cfg.plugin_dir, &mut pipeline, &cfg.values);
     let mut dev = Device::new();
     let ev_size = std::mem::size_of::<InputEvent>();
-    let mut pending_releases: Vec<(Instant, pipeline::EmitEvent)> = Vec::new();
+    let mut pending_releases: Vec<(Instant, EmitEvent)> = Vec::new();
 
     // inotify for device hotplug only
     let ifd = unsafe { inotify_init1(IN_NONBLOCK) };
     let mut have_inotify = false;
-    if ifd >= 0 {
-        if let Ok(cpath) = std::ffi::CString::new(INPUT_DIR) {
-            unsafe { inotify_add_watch(ifd, cpath.as_ptr(), IN_CREATE | IN_DELETE); }
-            have_inotify = true;
-        }
+    if ifd >= 0
+        && let Ok(cpath) = std::ffi::CString::new(INPUT_DIR)
+    {
+        unsafe { inotify_add_watch(ifd, cpath.as_ptr(), IN_CREATE | IN_DELETE); }
+        have_inotify = true;
     }
 
     let epfd = unsafe { epoll_create1(0) };
@@ -89,10 +97,11 @@ fn main() {
         }
 
         // Flush pending releases
-        flush_pending_releases(dev.ufd, &mut pending_releases);
+        let mut pctx = ProcCtx { pipeline: &pipeline, values: &cfg.values, ufd: dev.ufd, pending: &mut pending_releases };
+        flush_pending_releases(&mut pctx);
 
         // epoll_wait with timeout for periodic config checks
-        let timeout: i32 = if pending_releases.is_empty() { 500 } else { 50 };
+        let timeout: i32 = if pctx.pending.is_empty() { 500 } else { 50 };
         let mut events = [EpollEvent::default(); 2];
         if unsafe { epoll_wait(epfd, events.as_mut_ptr(), 2, timeout) } <= 0 { continue; }
 
@@ -126,14 +135,14 @@ fn main() {
                         ABS_Y  => { dev.ly = iev.value; dev.ld = true; skip = true; }
                         ABS_RX => { dev.rx = iev.value; dev.rd = true; skip = true; }
                         ABS_RY => { dev.ry = iev.value; dev.rd = true; skip = true; }
-                        ABS_Z  => { if process_trigger(&mut iev, Side::Left,  &pipeline, &cfg.values, dev.ufd, &mut pending_releases) { skip = true; } }
-                        ABS_RZ => { if process_trigger(&mut iev, Side::Right, &pipeline, &cfg.values, dev.ufd, &mut pending_releases) { skip = true; } }
+                        ABS_Z if process_trigger(&mut iev, Side::Left, &mut pctx) => { skip = true; }
+                        ABS_RZ if process_trigger(&mut iev, Side::Right, &mut pctx) => { skip = true; }
                         _ => {}
                     },
                     EV_KEY => {
                         let mut e = Event::Button { code: iev.code, pressed: iev.value != 0 };
                         let (emits, dropped) = pipeline.run(&mut e, &cfg.values);
-                        flush_emits(dev.ufd, &iev, &emits, &mut pending_releases);
+                        flush_emits(&mut pctx, &iev, &emits);
                         if dropped { skip = true; }
                         else { iev.value = if e.pressed() { 1 } else { 0 }; }
                     }
@@ -141,11 +150,11 @@ fn main() {
                         let _ = fs::write(RAW_FILE_L, format!("{} {}", dev.lx, dev.ly));
                         let _ = fs::write(RAW_FILE_R, format!("{} {}", dev.rx, dev.ry));
                         if dev.ld {
-                            process_stick(&iev, Side::Left, dev.lx, dev.ly, ABS_X as u16, ABS_Y as u16, &pipeline, &cfg.values, dev.ufd, &mut pending_releases);
+                            process_stick(&iev, Side::Left, dev.lx, dev.ly, ABS_X as u16, ABS_Y as u16, &mut pctx);
                             dev.ld = false;
                         }
                         if dev.rd {
-                            process_stick(&iev, Side::Right, dev.rx, dev.ry, ABS_RX as u16, ABS_RY as u16, &pipeline, &cfg.values, dev.ufd, &mut pending_releases);
+                            process_stick(&iev, Side::Right, dev.rx, dev.ry, ABS_RX as u16, ABS_RY as u16, &mut pctx);
                             dev.rd = false;
                         }
                     }
@@ -183,52 +192,50 @@ fn connect_device(dev: &mut Device, vid: u16, pid: u16) {
 }
 
 /// Flush expired pending key releases to the virtual device.
-fn flush_pending_releases(ufd: i32, pending: &mut Vec<(Instant, pipeline::EmitEvent)>) {
-    if pending.is_empty() { return; }
+fn flush_pending_releases(pctx: &mut ProcCtx) {
+    if pctx.pending.is_empty() { return; }
     let now = Instant::now();
     let mut i = 0;
-    while i < pending.len() {
-        if pending[i].0 <= now {
-            let emit = pending.swap_remove(i).1;
-            let mut rev = InputEvent::default();
-            rev.type_ = emit.ev_type; rev.code = emit.code; rev.value = 0;
-            unsafe { write_ev(ufd, &rev); }
-            rev.type_ = EV_SYN as u16; rev.code = SYN_REPORT as u16; rev.value = 0;
-            unsafe { write_ev(ufd, &rev); }
-            pending.swap_remove(i);
+    while i < pctx.pending.len() {
+        if pctx.pending[i].0 <= now {
+            let emit = pctx.pending.swap_remove(i).1;
+            let rev = InputEvent { type_: emit.ev_type, code: emit.code, value: 0, ..Default::default() };
+            unsafe { write_ev(pctx.ufd, &rev); }
+            let syn = InputEvent { type_: EV_SYN as u16, code: SYN_REPORT as u16, value: 0, ..Default::default() };
+            unsafe { write_ev(pctx.ufd, &syn); }
         } else { i += 1; }
     }
 }
 
 /// Write emitted events from plugin to virtual device, scheduling hold releases.
-fn flush_emits(ufd: i32, base: &InputEvent, emits: &[pipeline::EmitEvent], pending: &mut Vec<(Instant, pipeline::EmitEvent)>) {
+fn flush_emits(pctx: &mut ProcCtx, base: &InputEvent, emits: &[EmitEvent]) {
     for emit in emits {
         let mut se = *base; se.type_ = emit.ev_type; se.code = emit.code; se.value = emit.value;
-        unsafe { write_ev(ufd, &se); }
+        unsafe { write_ev(pctx.ufd, &se); }
         if let Some(ms) = emit.hold_ms
             && emit.value == 1 && emit.ev_type == EV_KEY as u16 {
-            pending.push((Instant::now() + Duration::from_millis(ms),
-                pipeline::EmitEvent { ev_type: emit.ev_type, code: emit.code, value: 0, hold_ms: None }));
+            pctx.pending.push((Instant::now() + Duration::from_millis(ms),
+                EmitEvent { ev_type: emit.ev_type, code: emit.code, value: 0, hold_ms: None }));
         }
     }
 }
 
 /// Process a trigger event through the pipeline. Returns true if dropped (skip original).
-fn process_trigger(iev: &mut InputEvent, side: Side, pipeline: &Pipeline, values: &HashMap<String, String>, ufd: i32, pending: &mut Vec<(Instant, pipeline::EmitEvent)>) -> bool {
+fn process_trigger(iev: &mut InputEvent, side: Side, pctx: &mut ProcCtx) -> bool {
     let mut e = Event::Trigger { value: iev.value, side };
-    let (emits, dropped) = pipeline.run(&mut e, values);
-    flush_emits(ufd, iev, &emits, pending);
+    let (emits, dropped) = pctx.pipeline.run(&mut e, pctx.values);
+    flush_emits(pctx, iev, &emits);
     if dropped { return true; }
     iev.value = e.value();
     false
 }
 
 /// Process a stick event through the pipeline and write axis values.
-fn process_stick(iev: &InputEvent, side: Side, x: i32, y: i32, code_x: u16, code_y: u16, pipeline: &Pipeline, values: &HashMap<String, String>, ufd: i32, pending: &mut Vec<(Instant, pipeline::EmitEvent)>) {
+fn process_stick(iev: &InputEvent, side: Side, x: i32, y: i32, code_x: u16, code_y: u16, pctx: &mut ProcCtx) {
     let mut e = Event::Stick { x, y, side };
-    let (emits, _) = pipeline.run(&mut e, values);
+    let (emits, _) = pctx.pipeline.run(&mut e, pctx.values);
     let mut se = *iev; se.type_ = EV_ABS as u16;
-    se.code = code_x; se.value = e.x(); unsafe { write_ev(ufd, &se); }
-    se.code = code_y; se.value = e.y(); unsafe { write_ev(ufd, &se); }
-    flush_emits(ufd, iev, &emits, pending);
+    se.code = code_x; se.value = e.x(); unsafe { write_ev(pctx.ufd, &se); }
+    se.code = code_y; se.value = e.y(); unsafe { write_ev(pctx.ufd, &se); }
+    flush_emits(pctx, iev, &emits);
 }

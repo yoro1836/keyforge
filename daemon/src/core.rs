@@ -176,7 +176,7 @@ impl Device {
             do_ioctl(u, UI_SET_EVBIT, EV_SYN as usize);
 
             // Copy KEY bits from physical device (same as memo.c)
-            let key_bytes = (KEY_CNT + 7) / 8;
+            let key_bytes = KEY_CNT.div_ceil(8);
             let mut kbuf: Vec<u8> = vec![0u8; key_bytes];
             if do_ioctl_ptr(fd, eviocgbit(EV_KEY as u8, key_bytes as u8), kbuf.as_mut_ptr()) >= 0 {
                 for i in 0..KEY_CNT {
@@ -187,7 +187,7 @@ impl Device {
             }
 
             // Copy ABS bits + absinfo from physical device (same as memo.c)
-            let abs_bytes = (ABS_CNT + 7) / 8;
+            let abs_bytes = ABS_CNT.div_ceil(8);
             let mut abuf: Vec<u8> = vec![0u8; abs_bytes];
             if do_ioctl_ptr(fd, eviocgbit(EV_ABS as u8, abs_bytes as u8), abuf.as_mut_ptr()) >= 0 {
                 for i in 0..ABS_CNT as u32 {
