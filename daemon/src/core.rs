@@ -87,6 +87,7 @@ pub const EPOLL_CTL_DEL: i32 = 2;
 pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLHUP: u32 = 0x010;
 pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLET: u32 = 0x8000_0000;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -242,6 +243,14 @@ impl Device {
             }
         }
         -1
+    }
+
+    /// Check if the physical device is still connected by doing a no-op ioctl.
+    /// Returns false if the fd is invalid or the device is gone.
+    pub fn is_alive(fd: i32) -> bool {
+        if fd < 0 { return false; }
+        let mut id = InputId::default();
+        unsafe { do_ioctl_ptr(fd, EVIOCGID, &mut id) == 0 }
     }
 }
 

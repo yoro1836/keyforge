@@ -51,14 +51,14 @@ fn main() {
     let epfd = unsafe { epoll_create1(0) };
     if epfd < 0 { eprintln!("keyforge: epoll_create1 failed"); std::process::exit(1); }
 
-    // Register inotify fd
-    let mut ep_if = EpollEvent { events: EPOLLIN, data: 0 };
+    // Register inotify fd (edge-triggered)
+    let mut ep_if = EpollEvent { events: EPOLLIN | EPOLLET, data: 0 };
     if have_inotify {
         ep_if.data = ifd as u64;
         unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, ifd, &mut ep_if); }
     }
 
-    let mut ep_dev = EpollEvent { events: EPOLLIN, data: 0 };
+    let mut ep_dev = EpollEvent { events: EPOLLIN | EPOLLET, data: 0 };
 
     // Find device, wait 1s, then create virtual device
     connect_device(&mut dev, cfg.vid, cfg.pid);
@@ -73,6 +73,16 @@ fn main() {
         if force_cfg_check || now.duration_since(last_cfg_check).as_millis() >= 500 {
             force_cfg_check = false;
             last_cfg_check = now;
+
+            // Check if physical device is still alive (handles silent disconnect)
+            if have_dev && !Device::is_alive(dev.fd) {
+                eprintln!("keyforge: device gone (alive check failed)");
+                unsafe { epoll_ctl(epfd, EPOLL_CTL_DEL, dev.fd, &mut ep_dev); }
+                dev.deinit();
+                have_dev = false;
+                pending_releases.clear();
+            }
+
             let fresh = Config::load(config_path);
             let vid_changed = fresh.vid != cfg.vid || fresh.pid != cfg.pid;
             let settings_changed = fresh.values != cfg.values || fresh.plugin_dir != cfg.plugin_dir;
