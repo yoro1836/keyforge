@@ -8,9 +8,9 @@ with direct access to `/dev/input`.
 
 ## How It Works
 
-1. **KeyForge creates a virtual controller** via uinput — mirrors your physical device's buttons and axes
-2. **Your physical device is grabbed exclusively** — raw input goes through the Lua pipeline
-3. **Lua plugins process every event** — modify stick curves, apply deadzones, remap buttons
+1. **Your physical device is detected** — KeyForge grabs it exclusively via `/dev/input`
+2. **After 1s, KeyForge creates a virtual controller** via uinput — mirrors your physical device's buttons and axes
+3. **Raw input goes through the Lua pipeline** — modify stick curves, apply deadzones, remap buttons
 4. **Transformed output goes to the virtual device** — any app sees it as real controller input
 
 ## Features
