@@ -51,14 +51,14 @@ fn main() {
     let epfd = unsafe { epoll_create1(0) };
     if epfd < 0 { eprintln!("keyforge: epoll_create1 failed"); std::process::exit(1); }
 
-    // Register inotify fd (edge-triggered)
-    let mut ep_if = EpollEvent { events: EPOLLIN | EPOLLET, data: 0 };
+    // Register inotify fd (level-triggered)
+    let mut ep_if = EpollEvent { events: EPOLLIN, data: 0 };
     if have_inotify {
         ep_if.data = ifd as u64;
         unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, ifd, &mut ep_if); }
     }
 
-    let mut ep_dev = EpollEvent { events: EPOLLIN | EPOLLET, data: 0 };
+    let mut ep_dev = EpollEvent { events: EPOLLIN, data: 0 };
 
     // Find device, wait 1s, then create virtual device
     connect_device(&mut dev, cfg.vid, cfg.pid);
@@ -134,8 +134,15 @@ fn main() {
             let mut iev = InputEvent::default();
             let rb = unsafe { read(dev.fd, &mut iev as *mut _ as *mut u8, ev_size) };
             if rb != ev_size as isize {
-                // rb == 0 (EOF / device gone), rb < 0 with non-EAGAIN error, or HUP → disconnect
-                if rb == 0 || fd_hup || (rb < 0 && get_errno() != EAGAIN) { disconnected = true; }
+                // rb == 0 (EOF / device gone), HUP, non-EAGAIN error, or device
+                // silently gone (level-triggered epoll keeps reporting fd ready but
+                // read returns EAGAIN) → disconnect
+                if rb == 0 || fd_hup
+                    || (rb < 0 && get_errno() != EAGAIN)
+                    || (rb < 0 && have_dev && !Device::is_alive(dev.fd))
+                {
+                    disconnected = true;
+                }
                 break;
             }
             unsafe {

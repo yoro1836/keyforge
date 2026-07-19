@@ -87,7 +87,6 @@ pub const EPOLL_CTL_DEL: i32 = 2;
 pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLHUP: u32 = 0x010;
 pub const EPOLLERR: u32 = 0x008;
-pub const EPOLLET: u32 = 0x8000_0000;
 
 // ---------------------------------------------------------------------------
 // Constants
