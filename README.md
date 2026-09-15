@@ -9,7 +9,7 @@ direct access to `/dev/input`.
 ## How It Works
 
 1. **Your physical device is detected** — KeyForge grabs it exclusively via `/dev/input`
-2. **After 1s, KeyForge creates a virtual controller** via uinput — mirrors your physical device's buttons and axes
+2. **After 1s, KeyForge creates a virtual controller** via UHID — mirrors your physical device's buttons and axes as a kernel HID device
 3. **Raw input goes through the Lua pipeline** — modify stick curves, apply deadzones, remap buttons
 4. **Transformed output goes to the virtual device** — any app sees it as real controller input
 
@@ -17,7 +17,7 @@ direct access to `/dev/input`.
 
 - **Lua pipeline** — chain plugins that process stick, trigger, and button events
 - **Plugin API** — `pf.emit(type, code, value)`, `pf.drop()`, `pf.log()` for full control
-- **Device mirroring** — copies physical device capabilities (keys, axes, absinfo) to virtual device
+- **Device mirroring** — builds a UHID HID mirror of the physical device's buttons and stick/trigger axes
 - **Physical-device hiding** — KernelSU/Magisk can unlink the selected event node so Android unregisters the physical controller; AX Manager never exposes this control
 - **Vue WebUI** — offline Vue 3 interface with a Material 3 Expressive design
 - **Hot reload** — config changes detected within 500ms, no restart needed
@@ -130,10 +130,11 @@ module/            Installable AX Manager / KernelSU / Magisk module
 webui/             Vue 3 + Vite WebUI source
   src/App.vue      Device, hiding, plugin, and daemon controls
   src/bridge.js    AX Manager and KernelSU command bridge adapter
-daemon/            Rust daemon (evdev → pipeline → uinput)
+daemon/            Rust daemon (evdev → pipeline → UHID)
   src/
     main.rs        Event loop, config polling, hotplug, visibility changes
-    core.rs        FFI, ioctl, Device, uinput, device-node isolation and recovery
+    core.rs        FFI, ioctl, Device, device-node isolation and recovery
+    uhid.rs        UHID C-API port, report builders, Lua `uh` table, mirror
     pipeline.rs    Event types, pipeline, Processor trait, EmitEvent
     plugin/
       mod.rs       Lua plugin loader, LuaProcessor

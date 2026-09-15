@@ -4,6 +4,7 @@ mod pipeline;
 mod plugin;
 mod uhid;
 
+use crate::uhid::Mirror;
 use config::Config;
 use core::*;
 use mlua::Lua;
@@ -14,14 +15,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Shared processing context: pipeline, config values, uinput fd, pending releases.
+/// Shared processing context: pipeline, config values, pending releases.
+/// Output goes to the UHID [`Mirror`], passed separately.
 struct ProcCtx<'a> {
     pipeline: &'a Pipeline,
     values: &'a HashMap<String, String>,
-    ufd: i32,
     pending: &'a mut Vec<(Instant, EmitEvent)>,
 }
-
 fn runtime_dir() -> PathBuf {
     for key in ["KEYFORGE_RUNTIME_DIR", "TMPDIR"] {
         if let Some(dir) = env::var_os(key)
@@ -159,6 +159,7 @@ fn main() {
     // queues every loop so OUTPUT/GET_REPORT never pile up unread.
     let mut uh_registry = crate::uhid::registry(&lua);
     let mut dev = Device::new(hidden_state_path);
+    let mut mirror: Option<Mirror> = None;
     let ev_size = std::mem::size_of::<InputEvent>();
     let runtime_dir = runtime_dir();
     let raw_file_l = runtime_dir.join(RAW_FILE_L);
@@ -206,6 +207,7 @@ fn main() {
         cfg.vid,
         cfg.pid,
         cfg.hide_device && allow_device_hide,
+        &mut mirror,
     );
     // epoll returns the opaque data stored at registration time.  Without
     // setting it here, the initial device's events carry data=0 and never
@@ -232,6 +234,9 @@ fn main() {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, dev.fd, &mut ep_dev);
                 }
                 dev.deinit();
+                if let Some(mirror) = mirror.take() {
+                    mirror.destroy();
+                }
                 have_dev = false;
                 pending_releases.clear();
             }
@@ -269,6 +274,9 @@ fn main() {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, dev.fd, &mut ep_dev);
                 }
                 dev.deinit();
+                if let Some(mirror) = mirror.take() {
+                    mirror.destroy();
+                }
                 have_dev = false;
                 pending_releases.clear();
             } else if hide_changed && have_dev {
@@ -279,6 +287,9 @@ fn main() {
                         epoll_ctl(epfd, EPOLL_CTL_DEL, dev.fd, &mut ep_dev);
                     }
                     dev.deinit();
+                    if let Some(mirror) = mirror.take() {
+                        mirror.destroy();
+                    }
                     have_dev = false;
                     pending_releases.clear();
                 } else if should_hide {
@@ -300,6 +311,7 @@ fn main() {
                 cfg.vid,
                 cfg.pid,
                 cfg.hide_device && allow_device_hide,
+                &mut mirror,
             );
             ep_dev.data = dev.fd as u64;
             unsafe {
@@ -312,10 +324,13 @@ fn main() {
         let mut pctx = ProcCtx {
             pipeline: &pipeline,
             values: &cfg.values,
-            ufd: dev.ufd,
             pending: &mut pending_releases,
         };
-        flush_pending_releases(&mut pctx);
+        let out = match mirror.as_mut() {
+            Some(mirror) => mirror,
+            None => continue,
+        };
+        flush_pending_releases(&mut pctx, out);
         if uh_registry.is_none() {
             uh_registry = crate::uhid::registry(&lua);
         }
@@ -366,101 +381,84 @@ fn main() {
                 }
                 break;
             }
-            unsafe {
-                let mut skip = false;
-                match iev.type_ as i32 {
-                    EV_ABS => match iev.code as u32 {
-                        ABS_X => {
-                            dev.lx = iev.value;
-                            dev.ld = true;
-                            skip = true;
-                        }
-                        ABS_Y => {
-                            dev.ly = iev.value;
-                            dev.ld = true;
-                            skip = true;
-                        }
-                        ABS_RX => {
-                            dev.rx = iev.value;
-                            dev.rd = true;
-                            skip = true;
-                        }
-                        ABS_RY => {
-                            dev.ry = iev.value;
-                            dev.rd = true;
-                            skip = true;
-                        }
-                        ABS_Z if process_trigger(&mut iev, Side::Left, &mut pctx) => {
-                            skip = true;
-                        }
-                        ABS_RZ if process_trigger(&mut iev, Side::Right, &mut pctx) => {
-                            skip = true;
-                        }
-                        _ => {}
-                    },
-                    EV_KEY => {
-                        let mut e = Event::Button {
-                            code: iev.code,
-                            pressed: iev.value != 0,
-                        };
-                        let (emits, dropped) = pipeline.run(&mut e, &cfg.values);
-                        flush_emits(&mut pctx, &iev, &emits);
-                        if dropped {
-                            skip = true;
-                        } else {
-                            iev.code = e.code();
-                            iev.value = if e.pressed() { 1 } else { 0 };
-                        }
+            match iev.type_ as i32 {
+                EV_ABS => match iev.code as u32 {
+                    ABS_X => {
+                        dev.lx = iev.value;
+                        dev.ld = true;
                     }
-                    EV_SYN if iev.code as u32 == SYN_REPORT => {
-                        let _ = fs::write(&raw_file_l, format!("{} {}", dev.lx, dev.ly));
-                        let _ = fs::write(&raw_file_r, format!("{} {}", dev.rx, dev.ry));
-                        if dev.ld {
-                            process_stick(
-                                &iev,
-                                Side::Left,
-                                dev.lx,
-                                dev.ly,
-                                ABS_X as u16,
-                                ABS_Y as u16,
-                                &mut pctx,
-                            );
-                            dev.ld = false;
-                        }
-                        if dev.rd {
-                            process_stick(
-                                &iev,
-                                Side::Right,
-                                dev.rx,
-                                dev.ry,
-                                ABS_RX as u16,
-                                ABS_RY as u16,
-                                &mut pctx,
-                            );
-                            dev.rd = false;
-                        }
+                    ABS_Y => {
+                        dev.ly = iev.value;
+                        dev.ld = true;
+                    }
+                    ABS_RX => {
+                        dev.rx = iev.value;
+                        dev.rd = true;
+                    }
+                    ABS_RY => {
+                        dev.ry = iev.value;
+                        dev.rd = true;
+                    }
+                    ABS_Z => {
+                        process_trigger(iev.value, Side::Left, &mut pctx, out);
+                    }
+                    ABS_RZ => {
+                        process_trigger(iev.value, Side::Right, &mut pctx, out);
                     }
                     _ => {}
+                },
+                EV_KEY => {
+                    let mut e = Event::Button {
+                        code: iev.code,
+                        pressed: iev.value != 0,
+                    };
+                    let (emits, dropped) = pipeline.run(&mut e, &cfg.values);
+                    flush_emits(&mut pctx, out, &emits);
+                    if !dropped {
+                        out.key(e.code(), e.pressed());
+                    }
                 }
-                if !skip {
-                    write_ev(dev.ufd, &iev);
+                EV_SYN if iev.code as u32 == SYN_REPORT => {
+                    let _ = fs::write(&raw_file_l, format!("{} {}", dev.lx, dev.ly));
+                    let _ = fs::write(&raw_file_r, format!("{} {}", dev.rx, dev.ry));
+                    if dev.ld {
+                        process_stick(Side::Left, dev.lx, dev.ly, ABS_X, ABS_Y, &mut pctx, out);
+                        dev.ld = false;
+                    }
+                    if dev.rd {
+                        process_stick(Side::Right, dev.rx, dev.ry, ABS_RX, ABS_RY, &mut pctx, out);
+                        dev.rd = false;
+                    }
                 }
+                _ => {}
             }
+        }
+        if let Err(error) = out.flush() {
+            eprintln!("keyforge: mirror flush failed: {error}");
         }
         if disconnected {
             unsafe {
                 epoll_ctl(epfd, EPOLL_CTL_DEL, dev.fd, &mut ep_dev);
             }
             dev.deinit();
+            if let Some(mirror) = mirror.take() {
+                mirror.destroy();
+            }
             have_dev = false;
             pending_releases.clear();
         }
     }
 }
 
-/// Find and grab the physical device, create its virtual mirror, then remove
-/// the physical event node so Android's EventHub unregisters it.
-fn connect_device(dev: &mut Device, vid: u16, pid: u16, hide_device: bool) {
+/// Find and grab the physical device, create its UHID virtual mirror, then
+/// remove the physical event node so Android's EventHub unregisters it.
+fn connect_device(
+    dev: &mut Device,
+    vid: u16,
+    pid: u16,
+    hide_device: bool,
+    mirror: &mut Option<Mirror>,
+) {
     loop {
         if let Some((fd, path)) = Device::find_device(vid, pid) {
             dev.fd = fd;
@@ -481,19 +479,30 @@ fn connect_device(dev: &mut Device, vid: u16, pid: u16, hide_device: bool) {
                 }
                 eprintln!("keyforge: physical device removed from Android EventHub");
             }
-            if dev.init_u(dev.fd, vid) {
-                eprintln!("keyforge: virtual device created");
-                return;
+            let (codes, abs) = Device::read_caps(dev.fd);
+            match Mirror::create(
+                "KeyForge Virtual Controller",
+                vid,
+                0x02d1,
+                codes,
+                crate::uhid::mirror_axes(&abs),
+            ) {
+                Ok(created) => {
+                    *mirror = Some(created);
+                    eprintln!("keyforge: virtual device created");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("keyforge: virtual device creation failed: {error}; retrying");
+                    dev.deinit();
+                }
             }
-            eprintln!("keyforge: virtual device creation failed, retrying");
-            dev.deinit();
         }
         std::thread::sleep(Duration::from_millis(1000));
     }
 }
-
-/// Flush expired pending key releases to the virtual device.
-fn flush_pending_releases(pctx: &mut ProcCtx) {
+/// Flush expired pending key releases into the mirror state.
+fn flush_pending_releases(pctx: &mut ProcCtx, out: &mut Mirror) {
     if pctx.pending.is_empty() {
         return;
     }
@@ -502,40 +511,28 @@ fn flush_pending_releases(pctx: &mut ProcCtx) {
     while i < pctx.pending.len() {
         if pctx.pending[i].0 <= now {
             let emit = pctx.pending.swap_remove(i).1;
-            let rev = InputEvent {
-                type_: emit.ev_type,
-                code: emit.code,
-                value: 0,
-                ..Default::default()
-            };
-            unsafe {
-                write_ev(pctx.ufd, &rev);
-            }
-            let syn = InputEvent {
-                type_: EV_SYN as u16,
-                code: SYN_REPORT as u16,
-                value: 0,
-                ..Default::default()
-            };
-            unsafe {
-                write_ev(pctx.ufd, &syn);
-            }
+            apply_emit(out, &emit);
         } else {
             i += 1;
         }
     }
+    if let Err(error) = out.flush() {
+        eprintln!("keyforge: mirror flush failed: {error}");
+    }
 }
 
-/// Write emitted events from plugin to virtual device, scheduling hold releases.
-fn flush_emits(pctx: &mut ProcCtx, base: &InputEvent, emits: &[EmitEvent]) {
+/// Apply one emit (or release) to the mirror state.
+fn apply_emit(out: &mut Mirror, emit: &EmitEvent) {
+    match emit.ev_type as i32 {
+        EV_KEY => out.key(emit.code, emit.value != 0),
+        EV_ABS => out.abs(emit.code as u32, emit.value),
+        _ => {}
+    }
+}
+/// Write emitted events from plugins into the mirror, scheduling holds.
+fn flush_emits(pctx: &mut ProcCtx, out: &mut Mirror, emits: &[EmitEvent]) {
     for emit in emits {
-        let mut se = *base;
-        se.type_ = emit.ev_type;
-        se.code = emit.code;
-        se.value = emit.value;
-        unsafe {
-            write_ev(pctx.ufd, &se);
-        }
+        apply_emit(out, emit);
         if let Some(ms) = emit.hold_ms
             && emit.value == 1
             && emit.ev_type == EV_KEY as u16
@@ -553,46 +550,36 @@ fn flush_emits(pctx: &mut ProcCtx, base: &InputEvent, emits: &[EmitEvent]) {
     }
 }
 
-/// Process a trigger event through the pipeline. Returns true if dropped (skip original).
-fn process_trigger(iev: &mut InputEvent, side: Side, pctx: &mut ProcCtx) -> bool {
-    let mut e = Event::Trigger {
-        value: iev.value,
-        side,
-    };
+/// Process a trigger event through the pipeline into the mirror.
+fn process_trigger(value: i32, side: Side, pctx: &mut ProcCtx, out: &mut Mirror) {
+    let mut e = Event::Trigger { value, side };
     let (emits, dropped) = pctx.pipeline.run(&mut e, pctx.values);
-    flush_emits(pctx, iev, &emits);
+    flush_emits(pctx, out, &emits);
     if dropped {
-        return true;
+        return;
     }
-    iev.value = e.value();
-    false
+    let code = match side {
+        Side::Left => ABS_Z,
+        Side::Right => ABS_RZ,
+    };
+    out.abs(code, e.value());
 }
 
-/// Process a stick event through the pipeline and write axis values.
+/// Process a stick event through the pipeline into the mirror.
 fn process_stick(
-    iev: &InputEvent,
     side: Side,
     x: i32,
     y: i32,
-    code_x: u16,
-    code_y: u16,
+    code_x: u32,
+    code_y: u32,
     pctx: &mut ProcCtx,
+    out: &mut Mirror,
 ) {
     let mut e = Event::Stick { x, y, side };
     let (emits, dropped) = pctx.pipeline.run(&mut e, pctx.values);
     if !dropped {
-        let mut se = *iev;
-        se.type_ = EV_ABS as u16;
-        se.code = code_x;
-        se.value = e.x();
-        unsafe {
-            write_ev(pctx.ufd, &se);
-        }
-        se.code = code_y;
-        se.value = e.y();
-        unsafe {
-            write_ev(pctx.ufd, &se);
-        }
+        out.abs(code_x, e.x());
+        out.abs(code_y, e.y());
     }
-    flush_emits(pctx, iev, &emits);
+    flush_emits(pctx, out, &emits);
 }

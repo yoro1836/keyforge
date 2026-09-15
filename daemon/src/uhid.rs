@@ -340,6 +340,19 @@ impl Drop for UhidDevice {
     }
 }
 
+impl GamepadAxis {
+    /// Stable state-map key shared by Lua input and the evdev mirror.
+    pub fn name(self) -> &'static str {
+        match self {
+            GamepadAxis::X => "x",
+            GamepadAxis::Y => "y",
+            GamepadAxis::Z => "z",
+            GamepadAxis::Rx => "rx",
+            GamepadAxis::Ry => "ry",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lua-friendly report descriptors + packing plans
 // ---------------------------------------------------------------------------
@@ -532,6 +545,178 @@ pub struct MouseState {
     pub x: i32,
     pub y: i32,
     pub wheel: i32,
+}
+// ---------------------------------------------------------------------------
+// Virtual mirror: evdev output state -> UHID gamepad report
+// ---------------------------------------------------------------------------
+
+/// Map physical ABS codes onto gamepad axes, in increasing code order.
+pub fn mirror_axes(abs_codes: &[u32]) -> Vec<(u32, GamepadAxis)> {
+    let mut out = Vec::new();
+    for code in abs_codes {
+        let axis = match *code {
+            crate::core::ABS_X => Some(GamepadAxis::X),
+            crate::core::ABS_Y => Some(GamepadAxis::Y),
+            crate::core::ABS_Z => Some(GamepadAxis::Z),
+            crate::core::ABS_RX => Some(GamepadAxis::Rx),
+            crate::core::ABS_RY => Some(GamepadAxis::Ry),
+            _ => None,
+        };
+        if let Some(axis) = axis {
+            out.push((*code, axis));
+        }
+    }
+    out
+}
+
+/// Descriptor + index maps mirroring one physical device.
+pub struct MirrorMap {
+    pub layout: ReportLayout,
+    pub codes: Vec<u16>,
+    pub axes: Vec<(u32, GamepadAxis)>,
+}
+
+/// Build the mirror descriptor. Button codes are sorted so the mapping is
+/// deterministic; more than 32 buttons are truncated (HID gamepad limit here).
+pub fn mirror_layout(
+    mut codes: Vec<u16>,
+    axes: Vec<(u32, GamepadAxis)>,
+) -> io::Result<(Vec<u8>, MirrorMap)> {
+    codes.sort_unstable();
+    if codes.len() > 32 {
+        eprintln!(
+            "keyforge: mirror supports 32 buttons, truncating {}",
+            codes.len()
+        );
+        codes.truncate(32);
+    }
+    let gamepad_axes: Vec<GamepadAxis> = axes.iter().map(|(_, axis)| *axis).collect();
+    let layout = ReportLayout::gamepad(codes.len() as u8, gamepad_axes, false)?;
+    let descriptor = gamepad_descriptor(codes.len() as u8, &layout_axes(&layout), false);
+    Ok((
+        descriptor,
+        MirrorMap {
+            layout,
+            codes,
+            axes,
+        },
+    ))
+}
+
+fn layout_axes(layout: &ReportLayout) -> Vec<GamepadAxis> {
+    match layout {
+        ReportLayout::Gamepad { axes, .. } => axes.clone(),
+        _ => Vec::new(),
+    }
+}
+
+impl MirrorMap {
+    pub fn blank_state(&self) -> GamepadState {
+        GamepadState {
+            buttons: vec![false; self.codes.len()],
+            axes: HashMap::new(),
+            hat: 0,
+        }
+    }
+
+    /// Apply a button event; returns true when the state changed.
+    pub fn apply_key(&self, state: &mut GamepadState, code: u16, pressed: bool) -> bool {
+        match self.codes.binary_search(&code) {
+            Ok(i) if i < state.buttons.len() && state.buttons[i] != pressed => {
+                state.buttons[i] = pressed;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply an axis event; returns true when the state changed.
+    pub fn apply_abs(&self, state: &mut GamepadState, abs: u32, value: i32) -> bool {
+        let Some(axis) = self
+            .axes
+            .iter()
+            .find_map(|(code, axis)| (*code == abs).then_some(*axis))
+        else {
+            return false;
+        };
+        let value = value.clamp(-32767, 32767);
+        if state.axes.get(axis.name()).copied().unwrap_or(0) != value {
+            state.axes.insert(axis.name().to_string(), value);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pack(&self, state: &GamepadState) -> io::Result<Vec<u8>> {
+        pack_gamepad(&self.layout, state)
+    }
+}
+
+/// Owned virtual mirror: HID device plus dirty-tracked output state.
+pub struct Mirror {
+    device: UhidDevice,
+    map: MirrorMap,
+    state: GamepadState,
+    dirty: bool,
+}
+
+impl Mirror {
+    pub fn create(
+        name: &str,
+        vid: u16,
+        product: u16,
+        codes: Vec<u16>,
+        axes: Vec<(u32, GamepadAxis)>,
+    ) -> io::Result<Self> {
+        let (descriptor, map) = mirror_layout(codes, axes)?;
+        let device = UhidDevice::open()?;
+        let params = CreateParams {
+            name: name.as_bytes().to_vec(),
+            phys: b"keyforge/input0".to_vec(),
+            uniq: Vec::new(),
+            bus: BUS_USB,
+            vendor: vid as u32,
+            product: product as u32,
+            version: 1,
+            country: 0,
+            descriptor,
+        };
+        device.create(&params)?;
+        Ok(Mirror {
+            device,
+            state: map.blank_state(),
+            map,
+            dirty: false,
+        })
+    }
+
+    pub fn key(&mut self, code: u16, pressed: bool) {
+        if self.map.apply_key(&mut self.state, code, pressed) {
+            self.dirty = true;
+        }
+    }
+
+    pub fn abs(&mut self, abs: u32, value: i32) {
+        if self.map.apply_abs(&mut self.state, abs, value) {
+            self.dirty = true;
+        }
+    }
+
+    /// Send one HID report when the state changed since the last flush.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let report = self.map.pack(&self.state)?;
+        self.device.input(&report)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn destroy(self) {
+        let _ = self.device.destroy();
+    }
 }
 
 pub fn pack_mouse(state: &MouseState) -> Vec<u8> {
@@ -1294,5 +1479,46 @@ mod tests {
             .eval()
             .expect("create roundtrip must not crash Lua");
         assert!(survived);
+    }
+
+    #[test]
+    fn mirror_layout_sorts_and_truncates_buttons() {
+        let (descriptor, map) =
+            mirror_layout(vec![307, 304, 305], mirror_axes(&[0, 1])).expect("mirror layout");
+        assert_eq!(map.codes, vec![304, 305, 307]);
+        assert_eq!(map.axes.len(), 2);
+        assert!(!descriptor.is_empty());
+
+        let many: Vec<u16> = (0..64).collect();
+        let (_, map) = mirror_layout(many, mirror_axes(&[0])).expect("truncated layout");
+        assert_eq!(map.codes.len(), 32);
+    }
+
+    #[test]
+    fn mirror_layout_rejects_empty_devices() {
+        assert!(mirror_layout(Vec::new(), mirror_axes(&[0])).is_err());
+        assert!(mirror_layout(vec![304], Vec::new()).is_err());
+    }
+
+    #[test]
+    fn mirror_state_packs_button_and_axis_updates() {
+        let (_, map) =
+            mirror_layout(vec![304, 305], mirror_axes(&[0, 1, 3, 4])).expect("mirror layout");
+        let mut state = map.blank_state();
+        assert_eq!(state.buttons, vec![false, false]);
+
+        assert!(map.apply_key(&mut state, 305, true));
+        assert!(!map.apply_key(&mut state, 305, true));
+        assert!(!map.apply_key(&mut state, 999, true));
+        assert!(map.apply_abs(&mut state, 0, 1000));
+        assert!(map.apply_abs(&mut state, 4, -2000));
+        assert!(!map.apply_abs(&mut state, 0x10, 5));
+
+        let report = map.pack(&state).expect("pack mirror state");
+        // Button index 1 -> second bit; X=1000 LE; RY=-2000 LE.
+        assert_eq!(&report[1..3], &1000i16.to_le_bytes());
+        assert_eq!(&report[3..5], &[0, 0]);
+        assert_eq!(&report[5..7], &[0, 0]);
+        assert_eq!(&report[7..9], &(-2000i16).to_le_bytes());
     }
 }
