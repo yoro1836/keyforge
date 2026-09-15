@@ -25,18 +25,47 @@ struct ProcCtx<'a> {
     pending: &'a mut Vec<(Instant, EmitEvent)>,
 }
 fn runtime_dir() -> PathBuf {
-    for key in ["KEYFORGE_RUNTIME_DIR", "TMPDIR"] {
-        if let Some(dir) = env::var_os(key)
-            && !dir.is_empty()
-        {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = env::var_os("KEYFORGE_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let tmpdir = env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    select_runtime_dir(tmpdir)
+}
+
+/// Pick a writable scratch home. Explicit homes are used verbatim; shared
+/// fallbacks get our own `keyforge` folder so /data/local/tmp stays clean.
+fn select_runtime_dir(tmpdir: Option<PathBuf>) -> PathBuf {
+    let mut fallbacks = Vec::new();
+    if let Some(tmp) = tmpdir {
+        fallbacks.push(tmp);
     }
     if cfg!(target_os = "android") {
-        PathBuf::from("/data/local/tmp")
+        fallbacks.push(PathBuf::from("/data/local/tmp"));
     } else {
-        env::temp_dir()
+        fallbacks.push(env::temp_dir());
     }
+    for base in &fallbacks {
+        let dir = base.join("keyforge");
+        if ensure_writable_dir(&dir) {
+            return dir;
+        }
+    }
+    env::temp_dir()
+}
+
+/// Create `dir` (including parents) and verify a probe file is writable.
+fn ensure_writable_dir(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".keyforge-write-{}", std::process::id()));
+    if fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    let _ = fs::remove_file(&probe);
+    true
 }
 
 /// Fixed shell-readable home for the daemon binary. The module directory is
@@ -699,6 +728,43 @@ mod tests {
         assert!(stage_binary(&src, &dest_dir));
         assert_eq!(fs::read(&dest).unwrap(), b"0123456789!");
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_runtime_home_is_used_verbatim() {
+        // Only KEYFORGE_RUNTIME_DIR is touched; no other test reads it.
+        let dir = std::env::temp_dir().join(format!("keyforge-explicit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("KEYFORGE_RUNTIME_DIR", &dir) };
+        let picked = runtime_dir();
+        unsafe { std::env::remove_var("KEYFORGE_RUNTIME_DIR") };
+        assert_eq!(picked, dir);
+        assert!(!dir.join("keyforge").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fallback_candidates_get_their_own_folder() {
+        let base = std::env::temp_dir().join(format!("keyforge-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let picked = select_runtime_dir(Some(base.clone()));
+        assert_eq!(picked, base.join("keyforge"));
+        assert!(picked.is_dir());
+        assert!(!base.join(".keyforge-write-12345").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn unwritable_candidate_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("keyforge-ro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(!ensure_writable_dir(&file.join("keyforge")));
+        assert!(ensure_writable_dir(&dir.join("keyforge")));
         fs::remove_dir_all(dir).unwrap();
     }
 }

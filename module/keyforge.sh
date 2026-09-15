@@ -33,12 +33,24 @@ log() {
 runtime_dir() {
     _saved=""
     [ -f "$RUNTIME_DIR_FILE" ] && read -r _saved < "$RUNTIME_DIR_FILE" 2>/dev/null
-    for _dir in "${KEYFORGE_RUNTIME_DIR:-}" "$_saved" "${TMPDIR:-}" /data/local/tmp /dev "$MODDIR"; do
+    # Explicit homes are used verbatim; shared fallbacks get our own
+    # `keyforge` folder so /data/local/tmp stays clean.
+    for _dir in "${KEYFORGE_RUNTIME_DIR:-}" "$_saved"; do
         [ -n "$_dir" ] && [ -d "$_dir" ] || continue
         _probe="$_dir/.keyforge-tmp-$$"
         if : > "$_probe" 2>/dev/null; then
             rm -f "$_probe"
             printf '%s' "$_dir"
+            return 0
+        fi
+    done
+    for _dir in "${TMPDIR:-}" /data/local/tmp /dev "$MODDIR"; do
+        [ -n "$_dir" ] || continue
+        mkdir -p "$_dir/keyforge" 2>/dev/null || continue
+        _probe="$_dir/keyforge/.keyforge-tmp-$$"
+        if : > "$_probe" 2>/dev/null; then
+            rm -f "$_probe"
+            printf '%s' "$_dir/keyforge"
             return 0
         fi
     done
