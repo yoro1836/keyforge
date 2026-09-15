@@ -47,10 +47,11 @@ compatible Magisk module WebUI client; all configuration remains in the same UI.
 1. Install the same module ZIP in shevery.
 2. The WebUI talks through the Shizuku shell bridge (`usesShellBridge=true`);
    no remote assets are loaded.
-3. In ADB-shell mode the daemon runs unprivileged (no `/dev/input` access,
-   no device hiding); in root mode everything works and device hiding is
-   available. Deleting the module makes the running daemon restore the
-   physical device and exit by itself.
+3. In ADB-shell mode the daemon runs with shell privileges: `/dev/input`
+   grab and `/dev/uhid` device creation work where the shell user belongs to
+   the `input`/`uhid` groups, but device hiding needs root. In root mode
+   everything works. Deleting the module makes the running daemon restore
+   the physical device and exit by itself.
 
 ## Physical-device hiding
 

@@ -402,16 +402,22 @@ pub enum ReportLayout {
 
 impl ReportLayout {
     pub fn gamepad(buttons: u8, axes: Vec<GamepadAxis>, hat: bool) -> io::Result<Self> {
-        if buttons == 0 || buttons > 32 {
+        if buttons > 32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "gamepad needs 1..32 buttons",
+                "gamepad needs 0..32 buttons",
             ));
         }
-        if axes.is_empty() || axes.len() > 5 {
+        if axes.len() > 5 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "gamepad needs 1..5 axes",
+                "gamepad needs 0..5 axes",
+            ));
+        }
+        if buttons == 0 && axes.is_empty() && !hat {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gamepad needs at least one control",
             ));
         }
         Ok(ReportLayout::Gamepad { buttons, axes, hat })
@@ -453,20 +459,24 @@ pub fn mouse_descriptor() -> Vec<u8> {
 /// Build a gamepad descriptor: N buttons, signed 16-bit axes, optional hat.
 pub fn gamepad_descriptor(buttons: u8, axes: &[GamepadAxis], hat: bool) -> Vec<u8> {
     let mut rd = vec![0x05, 0x01, 0x09, 0x04, 0xA1, 0x01];
-    rd.extend([
-        0x05, 0x09, 0x19, 0x01, 0x29, buttons, 0x15, 0x00, 0x25, 0x01,
-    ]);
-    rd.extend([0x75, 0x01, 0x95, buttons, 0x81, 0x02]);
-    let pad = (8 - buttons % 8) % 8;
-    if pad > 0 {
-        rd.extend([0x75, pad, 0x95, 0x01, 0x81, 0x03]);
+    if buttons > 0 {
+        rd.extend([
+            0x05, 0x09, 0x19, 0x01, 0x29, buttons, 0x15, 0x00, 0x25, 0x01,
+        ]);
+        rd.extend([0x75, 0x01, 0x95, buttons, 0x81, 0x02]);
+        let pad = (8 - buttons % 8) % 8;
+        if pad > 0 {
+            rd.extend([0x75, pad, 0x95, 0x01, 0x81, 0x03]);
+        }
     }
-    rd.extend([0x05, 0x01]);
-    for axis in axes {
-        rd.extend([0x09, axis.usage()]);
+    if !axes.is_empty() {
+        rd.extend([0x05, 0x01]);
+        for axis in axes {
+            rd.extend([0x09, axis.usage()]);
+        }
+        rd.extend([0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10]);
+        rd.extend([0x95, axes.len() as u8, 0x81, 0x02]);
     }
-    rd.extend([0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10]);
-    rd.extend([0x95, axes.len() as u8, 0x81, 0x02]);
     if hat {
         rd.extend([
             0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75,
@@ -1590,8 +1600,13 @@ mod tests {
 
     #[test]
     fn mirror_layout_rejects_empty_devices() {
-        assert!(mirror_layout(Vec::new(), mirror_axes(&[0])).is_err());
-        assert!(mirror_layout(vec![304], Vec::new()).is_err());
+        // No buttons, axes, or hat at all: nothing to mirror.
+        assert!(mirror_layout(Vec::new(), Vec::new()).is_err());
+        // Buttonless axis devices (sensors) and axisless button devices mirror fine.
+        let (_, axis_only) = mirror_layout(Vec::new(), mirror_axes(&[0])).expect("axis layout");
+        assert_eq!(axis_only.codes.len(), 0);
+        let (_, button_only) = mirror_layout(vec![304], Vec::new()).expect("button layout");
+        assert_eq!(button_only.codes, vec![304]);
     }
 
     #[test]
