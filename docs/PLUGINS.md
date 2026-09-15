@@ -152,3 +152,18 @@ Builders: `uh.gamepad({ buttons, axes = { "x", "y", ... }, hat })`,
 feed into `uh.create`. `dev:input()` accepts gamepad `{ x, y, z, rx, ry,
 hat, buttons }`, keyboard `{ modifiers, keys }`, and mouse `{ buttons, x,
 y, wheel }` tables. See `examples/uhid-gamepad.lua` for a full script.
+
+### Physical source selection
+
+The grabbed source device is also Lua-driven:
+
+```lua
+for _, dev in ipairs(uh.devices()) do
+    print(dev.name, string.format("%04x:%04x", dev.vid, dev.pid), dev.handler)
+end
+uh.source(0x045e, 0x028e)   -- switch source now
+local cur = uh.source_current()  -- { vid, pid }
+```
+
+`uh.source()` persists `VID`/`PID` to `keyforge.conf` (staying in sync with
+the WebUI) and the daemon reconnects on the same tick.

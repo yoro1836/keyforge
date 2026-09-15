@@ -54,6 +54,52 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Rewrite VID/PID lines in place (atomic tmp + rename), preserving
+    /// comments, key case, and every other line. Creates the file when absent
+    /// so Lua-driven source switches survive restarts and stay in sync with
+    /// the WebUI.
+    pub fn persist_source(path: &Path, vid: u16, pid: u16) -> std::io::Result<()> {
+        let mut lines: Vec<String> = Vec::new();
+        if path.exists() {
+            let raw = fs::read_to_string(path)?;
+            lines = raw.lines().map(str::to_string).collect();
+        }
+        let mut saw_vid = false;
+        let mut saw_pid = false;
+        for line in lines.iter_mut() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((key, _)) = trimmed.split_once('=') {
+                match key.trim().to_lowercase().as_str() {
+                    "vid" => {
+                        *line = format!("{}=0x{:04x}", key.trim(), vid);
+                        saw_vid = true;
+                    }
+                    "pid" => {
+                        *line = format!("{}=0x{:04x}", key.trim(), pid);
+                        saw_pid = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !saw_vid {
+            lines.push(format!("VID=0x{vid:04x}"));
+        }
+        if !saw_pid {
+            lines.push(format!("PID=0x{pid:04x}"));
+        }
+        let tmp = path.with_extension("tmp");
+
+        fs::write(&tmp, lines.join("\n") + "\n")?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+}
+
 fn parse_hex16(s: &str) -> u16 {
     let s = s.trim().strip_prefix("0x").unwrap_or(s);
     u16::from_str_radix(s, 16).unwrap_or(0)
@@ -92,5 +138,27 @@ mod tests {
         assert!(!config.values.contains_key("plugin_order"));
         assert!(!config.values.contains_key("hide_device"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persist_source_rewrites_ids_preserving_layout() {
+        let path =
+            std::env::temp_dir().join(format!("keyforge-source-{}.conf", std::process::id()));
+        fs::write(&path, "# comment\nVID=0x045e\nPID=0x028e\nPLUGIN_DIR=/x\n").unwrap();
+
+        Config::persist_source(&path, 0x054c, 0x0ce6).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# comment"));
+        assert!(raw.contains("VID=0x054c"));
+        assert!(raw.contains("PID=0x0ce6"));
+        assert!(raw.contains("PLUGIN_DIR=/x"));
+        let config = Config::load(&path);
+        assert_eq!((config.vid, config.pid), (0x054c, 0x0ce6));
+
+        fs::remove_file(&path).unwrap();
+        Config::persist_source(&path, 0x1234, 0x5678).unwrap();
+        let config = Config::load(&path);
+        assert_eq!((config.vid, config.pid), (0x1234, 0x5678));
+        fs::remove_file(&path).unwrap();
     }
 }

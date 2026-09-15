@@ -107,6 +107,63 @@ pub const fn eviocgbit(ev: u8, len: u8) -> u32 {
     ioc(2, b'E', 0x20 + ev, len)
 }
 
+pub const fn eviocgname(len: u8) -> u32 {
+    ioc(2, b'E', 0x06, len)
+}
+
+/// Visible input node for source selection (no grab, read-only probe).
+#[derive(Debug, Clone)]
+pub struct InputInfo {
+    pub name: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub handler: String,
+}
+
+/// List /dev/input/event* nodes with vendor/product/name, sorted by handler.
+pub fn list_inputs() -> Vec<InputInfo> {
+    let mut out = Vec::new();
+    let dir = match fs::read_dir(INPUT_DIR) {
+        Ok(dir) => dir,
+        Err(_) => return out,
+    };
+    let mut entries: Vec<_> = dir.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let handler = entry.file_name().to_string_lossy().into_owned();
+        if !handler.starts_with("event") {
+            continue;
+        }
+        let path = entry.path();
+        let cpath = match CString::new(path.to_string_lossy().as_bytes()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        unsafe {
+            let fd = open(cpath.as_ptr(), O_RDONLY | O_NONBLOCK, 0);
+            if fd < 0 {
+                continue;
+            }
+            let mut id = InputId::default();
+            let mut name = [0u8; 256];
+            let ok = do_ioctl_ptr(fd, EVIOCGID, &mut id) == 0
+                && do_ioctl_ptr(fd, eviocgname(u8::MAX), name.as_mut_ptr()) >= 0;
+            close(fd);
+            if !ok {
+                continue;
+            }
+            let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            out.push(InputInfo {
+                name: String::from_utf8_lossy(&name[..len]).into_owned(),
+                vid: id.vendor,
+                pid: id.product,
+                handler,
+            });
+        }
+    }
+    out
+}
+
 pub const IN_NONBLOCK: i32 = 0o4000;
 pub const IN_CREATE: u32 = 0x0000_0100;
 pub const IN_DELETE: u32 = 0x0000_0200;

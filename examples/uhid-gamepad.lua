@@ -6,10 +6,14 @@
 -- Flow per physical event:
 --   1. process() mirrors the left stick onto the virtual gamepad.
 --   2. uh.poll() drains kernel events (LED output, open/close, reports).
+--
+-- Physical source selection is Lua-driven too:
+--   for _, dev in ipairs(uh.devices()) do print(dev.name, dev.vid, dev.pid) end
+--   uh.source(0x045e, 0x028e)  -- switch source now; persisted to keyforge.conf
+--   local cur = uh.source_current()  -- { vid, pid }
 
 local pad = uh.create({
     name = "KeyForge Pad",
-    phys = "keyforge/input0",
     bus = uh.BUS_USB,
     vendor = 0x045e,
     product = 0x02e0,

@@ -155,6 +155,9 @@ fn main() {
             cfg.plugin_dir
         );
     }
+    // Physical source selection is Lua-driven too: scripts call
+    // uh.source(vid, pid); the request is persisted here and picked up below.
+    let source_ctl = crate::uhid::ensure_source(&lua, cfg.vid, cfg.pid);
     // Scripts declare UHID devices via the `uh` global; drain their kernel
     // queues every loop so OUTPUT/GET_REPORT never pile up unread.
     let mut uh_registry = crate::uhid::registry(&lua);
@@ -241,7 +244,17 @@ fn main() {
                 pending_releases.clear();
             }
 
+            // Lua-requested source switch: persist first so the normal reload
+            // path below reconnects on this same tick.
+            if let Some((vid, pid)) = source_ctl.take_request() {
+                eprintln!("keyforge: source switch requested: vid={vid:04x} pid={pid:04x}");
+                if let Err(error) = Config::persist_source(&config_path, vid, pid) {
+                    eprintln!("keyforge: failed to persist source: {error}");
+                }
+            }
+
             let fresh = Config::load(&config_path);
+
             let vid_changed = fresh.vid != cfg.vid || fresh.pid != cfg.pid;
             let hide_changed = fresh.hide_device != cfg.hide_device;
             let settings_changed = fresh.values != cfg.values
@@ -302,6 +315,7 @@ fn main() {
                 eprintln!("keyforge: device hiding ignored outside KernelSU or Magisk");
             }
             cfg = fresh;
+            source_ctl.set_current(cfg.vid, cfg.pid);
         }
 
         // Auto-connect if no device

@@ -984,6 +984,60 @@ fn lua_bytes(value: &Value) -> Vec<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Physical source selection from Lua
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceState {
+    current: (u16, u16),
+    request: Option<(u16, u16)>,
+}
+
+/// Shared source-device selection. Lua scripts call `uh.source(vid, pid)` to
+/// request a switch; the daemon loop persists it and reconnects.
+#[derive(Clone)]
+pub struct SourceCtl {
+    inner: Arc<Mutex<SourceState>>,
+}
+
+impl SourceCtl {
+    fn new(vid: u16, pid: u16) -> Self {
+        SourceCtl {
+            inner: Arc::new(Mutex::new(SourceState {
+                current: (vid, pid),
+                request: None,
+            })),
+        }
+    }
+
+    pub fn current(&self) -> (u16, u16) {
+        self.inner.lock().expect("source control").current
+    }
+
+    pub fn set_current(&self, vid: u16, pid: u16) {
+        self.inner.lock().expect("source control").current = (vid, pid);
+    }
+
+    pub fn request(&self, vid: u16, pid: u16) {
+        self.inner.lock().expect("source control").request = Some((vid, pid));
+    }
+
+    pub fn take_request(&self) -> Option<(u16, u16)> {
+        self.inner.lock().expect("source control").request.take()
+    }
+}
+
+/// Get-or-create the source control for a Lua state (survives reloads).
+pub fn ensure_source(lua: &Lua, vid: u16, pid: u16) -> SourceCtl {
+    if let Some(ctl) = lua.app_data_ref::<SourceCtl>() {
+        return ctl.clone();
+    }
+    let ctl = SourceCtl::new(vid, pid);
+    lua.set_app_data(ctl.clone());
+    ctl
+}
+
 /// Register the global `uh` table once per Lua state (idempotent reloads).
 pub fn register_uh(lua: &Lua) -> mlua::Result<()> {
     if lua.app_data_ref::<Registry>().is_some() {
@@ -993,6 +1047,46 @@ pub fn register_uh(lua: &Lua) -> mlua::Result<()> {
     lua.set_app_data(registry.clone());
 
     let uh = lua.create_table()?;
+    let source = ensure_source(lua, 0, 0);
+    uh.set(
+        "devices",
+        lua.create_function(move |lua, ()| {
+            let out = lua.create_table()?;
+            for (index, dev) in crate::core::list_inputs().iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("name", dev.name.clone())?;
+                item.set("vid", dev.vid)?;
+                item.set("pid", dev.pid)?;
+                item.set("handler", dev.handler.clone())?;
+                out.set(index + 1, item)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+    let select_ctl = source.clone();
+    uh.set(
+        "source",
+        lua.create_function(move |_, (vid, pid): (u32, u32)| {
+            for (label, value) in [("vid", vid), ("pid", pid)] {
+                if value > 0xFFFF {
+                    return Err(mlua::Error::runtime(format!("{label} out of range")));
+                }
+            }
+            select_ctl.request(vid as u16, pid as u16);
+            Ok(())
+        })?,
+    )?;
+    let current_ctl = source.clone();
+    uh.set(
+        "source_current",
+        lua.create_function(move |lua, ()| {
+            let (vid, pid) = current_ctl.current();
+            let out = lua.create_table()?;
+            out.set("vid", vid)?;
+            out.set("pid", pid)?;
+            Ok(out)
+        })?,
+    )?;
     uh.set("BUS_USB", BUS_USB)?;
     uh.set("BUS_BLUETOOTH", BUS_BLUETOOTH)?;
     uh.set("BUS_VIRTUAL", BUS_VIRTUAL)?;
@@ -1520,5 +1614,40 @@ mod tests {
         assert_eq!(&report[3..5], &[0, 0]);
         assert_eq!(&report[5..7], &[0, 0]);
         assert_eq!(&report[7..9], &(-2000i16).to_le_bytes());
+    }
+
+    #[test]
+    fn lua_source_select_roundtrip() {
+        let lua = Lua::new();
+        register_uh(&lua).expect("register uh");
+        let ctl = ensure_source(&lua, 0x045e, 0x028e);
+        // Registration seeds (0, 0); the daemon loop syncs current like this.
+        ctl.set_current(0x045e, 0x028e);
+        assert_eq!(ctl.current(), (0x045e, 0x028e));
+
+        lua.load(r#"uh.source(0x054c, 0x0ce6)"#)
+            .exec()
+            .expect("source select");
+        assert_eq!(ctl.take_request(), Some((0x054c, 0x0ce6)));
+        assert_eq!(ctl.take_request(), None);
+
+        ctl.set_current(0x054c, 0x0ce6);
+        let current: Table = lua
+            .load(r#"return uh.source_current()"#)
+            .eval()
+            .expect("source current");
+        assert_eq!(current.get::<u16>("vid").unwrap(), 0x054c);
+        assert_eq!(current.get::<u16>("pid").unwrap(), 0x0ce6);
+
+        // Out-of-range ids are rejected, never queued.
+        assert!(lua.load(r#"uh.source(0x1FFFF, 1)"#).exec().is_err());
+        assert_eq!(ctl.take_request(), None);
+
+        // Device enumeration never crashes, whatever /dev/input holds.
+        let count: usize = lua
+            .load(r#"return #uh.devices()"#)
+            .eval()
+            .expect("devices list");
+        let _ = count;
     }
 }
