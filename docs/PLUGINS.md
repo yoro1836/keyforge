@@ -120,3 +120,35 @@ end
 ## Available Lua
 
 Lua 5.4 standard library: `math`, `string`, `table`, `tonumber`, `tostring`, `pairs`, `ipairs`.
+
+## `uh` — UHID virtual devices
+
+Scripts can declare their own HID devices (gamepad, keyboard, mouse, or raw
+descriptors) via the Linux UHID interface. Declare at chunk top level; the
+daemon creates each named device once and reuses it across config reloads.
+Requires `/dev/uhid` on the device.
+
+```lua
+local pad = uh.create({
+    name = "KeyForge Pad",       -- reused across reloads by name
+    bus = uh.BUS_USB, vendor = 0x045e, product = 0x02e0, version = 1,
+    descriptor = uh.gamepad({ buttons = 16 }).descriptor,
+    kind = "gamepad", buttons = 16,   -- layout for :input()
+})
+
+pad:input({ x = 1000, y = -500, buttons = { 1, 3 } })
+pad:input_raw("\x00\x01\x02")   -- raw HID report bytes, no layout needed
+for _, item in ipairs(uh.poll()) do
+    -- item.device, item.event.type:
+    -- "start" | "stop" | "open" | "close" | "output" | "get_report" | "set_report"
+end
+pad:get_report_reply(id, 0, data)
+pad:set_report_reply(id, 0)
+pad:destroy()
+```
+
+Builders: `uh.gamepad({ buttons, axes = { "x", "y", ... }, hat })`,
+`uh.keyboard()`, `uh.mouse()` — each returns `{ kind, descriptor, ... }` to
+feed into `uh.create`. `dev:input()` accepts gamepad `{ x, y, z, rx, ry,
+hat, buttons }`, keyboard `{ modifiers, keys }`, and mouse `{ buttons, x,
+y, wheel }` tables. See `examples/uhid-gamepad.lua` for a full script.

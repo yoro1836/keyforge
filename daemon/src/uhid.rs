@@ -548,18 +548,26 @@ pub fn pack_mouse(state: &MouseState) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Registry {
+pub struct Registry {
     inner: Arc<Mutex<RegistryInner>>,
 }
 
 struct RegistryInner {
     next: u32,
     devices: HashMap<u32, RegistryEntry>,
+    pending: Vec<(u32, KernelEvent)>,
 }
 
 struct RegistryEntry {
+    name: String,
+    descriptor: Vec<u8>,
     device: UhidDevice,
     layout: Option<ReportLayout>,
+}
+
+/// Fetch the registry attached to a Lua state, if `uh` was registered.
+pub fn registry(lua: &Lua) -> Option<Registry> {
+    lua.app_data_ref::<Registry>().map(|r| r.clone())
 }
 
 impl Registry {
@@ -568,15 +576,30 @@ impl Registry {
             inner: Arc::new(Mutex::new(RegistryInner {
                 next: 1,
                 devices: HashMap::new(),
+                pending: Vec::new(),
             })),
         }
     }
 
-    fn insert(&self, device: UhidDevice, layout: Option<ReportLayout>) -> u32 {
+    fn insert(
+        &self,
+        name: String,
+        descriptor: Vec<u8>,
+        device: UhidDevice,
+        layout: Option<ReportLayout>,
+    ) -> u32 {
         let mut inner = self.inner.lock().expect("uhid registry");
         let id = inner.next;
         inner.next += 1;
-        inner.devices.insert(id, RegistryEntry { device, layout });
+        inner.devices.insert(
+            id,
+            RegistryEntry {
+                name,
+                descriptor,
+                device,
+                layout,
+            },
+        );
         id
     }
 
@@ -596,20 +619,41 @@ impl Registry {
             .remove(&id)
     }
 
-    /// Drain one batch of pending kernel events from every device.
-    fn drain(&self) -> Vec<(u32, KernelEvent)> {
-        let mut out = Vec::new();
+    /// Find a live device by name (reload-safe `uh.create` reuses it).
+    fn find_by_name(&self, name: &str) -> Option<(u32, Vec<u8>)> {
         let inner = self.inner.lock().expect("uhid registry");
-        for (id, entry) in inner.devices.iter() {
-            loop {
-                match entry.device.read_event() {
-                    Ok(Some(event)) => out.push((*id, event)),
-                    Ok(None) => break,
-                    Err(_) => break,
+        inner
+            .devices
+            .iter()
+            .find_map(|(id, entry)| (entry.name == name).then(|| (*id, entry.descriptor.clone())))
+    }
+
+    /// Drain one batch of pending kernel events from every device into the
+    /// shared queue. Cheap when idle (one non-blocking read per device).
+    pub fn pump(&self) {
+        let mut batch = Vec::new();
+        {
+            let inner = self.inner.lock().expect("uhid registry");
+            for (id, entry) in inner.devices.iter() {
+                loop {
+                    match entry.device.read_event() {
+                        Ok(Some(event)) => batch.push((*id, event)),
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
                 }
             }
         }
-        out
+        self.inner
+            .lock()
+            .expect("uhid registry")
+            .pending
+            .extend(batch);
+    }
+
+    /// Take queued kernel events accumulated by [`Registry::pump`].
+    pub fn take_pending(&self) -> Vec<(u32, KernelEvent)> {
+        std::mem::take(&mut self.inner.lock().expect("uhid registry").pending)
     }
 }
 
@@ -692,6 +736,7 @@ impl UserData for LuaUhidDevice {
                 .with(this.id, |entry| entry.device.set_report_reply(id, err))?;
             Ok(())
         });
+        methods.add_method("id", |_, this, ()| Ok(this.id));
         methods.add_method("destroy", |_, this, ()| {
             match this.registry.remove(this.id) {
                 Some(entry) => entry.device.destroy().map_err(mlua::Error::external),
@@ -787,7 +832,8 @@ pub fn register_uh(lua: &Lua) -> mlua::Result<()> {
     uh.set(
         "poll",
         lua.create_function(move |lua, ()| {
-            let drained = poll_registry.drain();
+            poll_registry.pump();
+            let drained = poll_registry.take_pending();
             let out = lua.create_table()?;
             for (index, (id, event)) in drained.iter().enumerate() {
                 let item = lua.create_table()?;
@@ -879,9 +925,26 @@ pub fn register_uh(lua: &Lua) -> mlua::Result<()> {
             if descriptor.is_empty() {
                 return Err(mlua::Error::runtime("uh.create needs a descriptor"));
             }
+            let raw_name = lua_bytes(&params.get::<Value>("name").unwrap_or(Value::Nil));
+            let name = String::from_utf8_lossy(&raw_name).into_owned();
+            // Reload-safe: a live device with the same name is reused instead
+            // of registering a duplicate kernel device on every config reload.
+            if !name.is_empty()
+                && let Some((id, old_descriptor)) = reg.find_by_name(&name)
+            {
+                if old_descriptor == descriptor {
+                    return lua.create_userdata(LuaUhidDevice {
+                        registry: reg.clone(),
+                        id,
+                    });
+                }
+                if let Some(old) = reg.remove(id) {
+                    let _ = old.device.destroy();
+                }
+            }
             let created = UhidDevice::open().map_err(mlua::Error::external)?;
             let create = CreateParams {
-                name: lua_bytes(&params.get::<Value>("name").unwrap_or(Value::Nil)),
+                name: raw_name,
                 phys: lua_bytes(&params.get::<Value>("phys").unwrap_or(Value::Nil)),
                 uniq: lua_bytes(&params.get::<Value>("uniq").unwrap_or(Value::Nil)),
                 bus: params.get::<u16>("bus").unwrap_or(BUS_USB),
@@ -889,7 +952,7 @@ pub fn register_uh(lua: &Lua) -> mlua::Result<()> {
                 product: params.get::<u32>("product").unwrap_or(0),
                 version: params.get::<u32>("version").unwrap_or(0),
                 country: params.get::<u32>("country").unwrap_or(0),
-                descriptor,
+                descriptor: descriptor.clone(),
             };
             if let Err(err) = created.create(&create) {
                 return Err(mlua::Error::external(err));
@@ -919,7 +982,7 @@ pub fn register_uh(lua: &Lua) -> mlua::Result<()> {
                 Ok("mouse") => Some(ReportLayout::Mouse),
                 _ => None,
             };
-            let id = reg.insert(created, layout);
+            let id = reg.insert(name, descriptor, created, layout);
             lua.create_userdata(LuaUhidDevice {
                 registry: reg.clone(),
                 id,
@@ -974,6 +1037,46 @@ mod tests {
             &[0x05, 0x01, 0x09, 0x04]
         );
         assert!(ev[OFF_CREATE_RD_DATA + 4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn create_reuses_live_device_by_name() {
+        // Needs a real /dev/uhid fd; elsewhere the open test above already
+        // covers the graceful failure path.
+        let Ok(_probe) = UhidDevice::open() else {
+            return;
+        };
+        let lua = Lua::new();
+        register_uh(&lua).expect("register uh");
+        let first: u32 = lua
+            .load(
+                r#"
+                local dev = uh.create({
+                    name = "keyforge-reuse-test",
+                    descriptor = uh.gamepad({buttons = 4}).descriptor,
+                    kind = "gamepad", buttons = 4,
+                })
+                return dev:id()
+                "#,
+            )
+            .eval()
+            .expect("first create");
+        let second: u32 = lua
+            .load(
+                r#"
+                -- Simulates a daemon config reload re-evaluating the script:
+                -- same name + descriptor must reuse the live kernel device.
+                local dev = uh.create({
+                    name = "keyforge-reuse-test",
+                    descriptor = uh.gamepad({buttons = 4}).descriptor,
+                    kind = "gamepad", buttons = 4,
+                })
+                return dev:id()
+                "#,
+            )
+            .eval()
+            .expect("second create");
+        assert_eq!(first, second);
     }
 
     #[test]

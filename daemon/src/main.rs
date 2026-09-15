@@ -155,6 +155,9 @@ fn main() {
             cfg.plugin_dir
         );
     }
+    // Scripts declare UHID devices via the `uh` global; drain their kernel
+    // queues every loop so OUTPUT/GET_REPORT never pile up unread.
+    let mut uh_registry = crate::uhid::registry(&lua);
     let mut dev = Device::new(hidden_state_path);
     let ev_size = std::mem::size_of::<InputEvent>();
     let runtime_dir = runtime_dir();
@@ -313,6 +316,12 @@ fn main() {
             pending: &mut pending_releases,
         };
         flush_pending_releases(&mut pctx);
+        if uh_registry.is_none() {
+            uh_registry = crate::uhid::registry(&lua);
+        }
+        if let Some(registry) = uh_registry.as_ref() {
+            registry.pump();
+        }
 
         // epoll_wait with timeout for periodic config checks
         let timeout: i32 = if pctx.pending.is_empty() { 500 } else { 50 };
