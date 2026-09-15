@@ -37,6 +37,7 @@ const frameworkLabel = computed(() => {
     kernelsu: 'KernelSU',
     magisk: 'Magisk',
     axmanager: 'AX Manager',
+    shizuku: 'shevery',
     unknown: 'Unknown manager',
   }
   return labels[runtime.value.framework] || runtime.value.framework
@@ -129,7 +130,7 @@ async function loadInstalledPlugins() {
 
 async function refreshAll({ quiet = false } = {}) {
   if (!hasCommandBridge()) {
-    bridgeError.value = 'WebUI command bridge unavailable. Open KeyForge from AX Manager or KernelSU.'
+    bridgeError.value = 'WebUI command bridge unavailable. Open KeyForge from AX Manager, KernelSU, or shevery.'
     initialLoading.value = false
     return
   }

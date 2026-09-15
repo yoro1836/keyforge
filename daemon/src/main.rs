@@ -100,6 +100,13 @@ fn main() {
     if cfg.hide_device && !allow_device_hide {
         eprintln!("keyforge: device hiding ignored outside KernelSU or Magisk");
     }
+    // shevery delete removes the whole module dir with no uninstall hook.
+    // Remember whether we run from a module so the loop below can exit
+    // instead of running orphaned (manual runs have no module.prop).
+    let module_prop = config_path
+        .parent()
+        .map(|parent| parent.join("module.prop"));
+    let module_managed = module_prop.as_deref().is_some_and(|prop| prop.exists());
 
     // Detach from the caller (double fork, like encored) so the daemon always
     // ends up owned by init — never by a WebUI app or any short-lived shell.
@@ -229,6 +236,16 @@ fn main() {
         if force_cfg_check || now.duration_since(last_cfg_check).as_millis() >= 500 {
             force_cfg_check = false;
             last_cfg_check = now;
+            // Module deleted out from under us (no uninstall hook on some
+            // managers): restore the physical device and exit cleanly.
+            if module_managed && module_prop.as_deref().is_some_and(|prop| !prop.exists()) {
+                eprintln!("keyforge: module directory removed; exiting");
+                if let Some(mirror) = mirror.take() {
+                    mirror.destroy();
+                }
+                dev.deinit();
+                std::process::exit(0);
+            }
 
             // Check if physical device is still alive (handles silent disconnect)
             if have_dev && !Device::is_alive(dev.fd) {

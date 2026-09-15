@@ -86,3 +86,98 @@ test('buildScriptCommand uses manager-specific module locations', () => {
   assert.match(rootCommand, /\/data\/adb\/modules\/keyforge\/keyforge\.sh 'runtime'/)
   assert.doesNotMatch(rootCommand, /axeron\/plugins/)
 })
+
+function withShizuku(shizuku, fn) {
+  const previous = {
+    Shizuku: globalThis.Shizuku,
+    Axeron: globalThis.Axeron,
+    ksu: globalThis.ksu,
+    kernelsu: globalThis.kernelsu,
+  }
+  delete globalThis.Axeron
+  delete globalThis.ksu
+  delete globalThis.kernelsu
+  if (shizuku === undefined) delete globalThis.Shizuku
+  else globalThis.Shizuku = shizuku
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete globalThis[key]
+        else globalThis[key] = value
+      }
+    })
+}
+
+test('parseShizukuResult handles shevery result shapes', async () => {
+  const { parseShizukuResult } = await import('./bridge.js')
+  assert.deepEqual(parseShizukuResult(JSON.stringify({ ok: true, exitCode: 0, stdout: 'hi\n', stderr: '', timedOut: false })), {
+    ok: true, exitCode: 0, stdout: 'hi\n', stderr: '', timedOut: false,
+  })
+  const failed = parseShizukuResult(JSON.stringify({ ok: false, exitCode: 1, stdout: '', stderr: 'nope', timedOut: false }))
+  assert.equal(failed.ok, false)
+  assert.equal(failed.stderr, 'nope')
+  const timedOut = parseShizukuResult(JSON.stringify({ ok: false, exitCode: 124, stdout: '', stderr: '', timedOut: true }))
+  assert.equal(timedOut.ok, false)
+  assert.match(timedOut.stderr, /timed out/i)
+  assert.equal(parseShizukuResult('plain output').stdout, 'plain output')
+})
+
+test('Shizuku bridge executes and reports errors', async () => {
+  const { execRoot, hasCommandBridge } = await import('./bridge.js')
+  await withShizuku(
+    {
+      exec: (command) => {
+        assert.equal(command, 'status')
+        return JSON.stringify({ ok: true, exitCode: 0, stdout: 'running pid=7\n', stderr: '', timedOut: false })
+      },
+    },
+    async () => {
+      assert.equal(hasCommandBridge(), true)
+      assert.equal(await execRoot('status'), 'running pid=7\n')
+    },
+  )
+  await withShizuku(
+    {
+      exec: () => JSON.stringify({ ok: false, exitCode: -1, stdout: '', stderr: 'bridge blocked', timedOut: false }),
+    },
+    async () => {
+      await assert.rejects(execRoot('status'), /bridge blocked/)
+    },
+  )
+})
+
+test('buildScriptCommand prefers the Shizuku module directory', async () => {
+  const { buildScriptCommand, shizukuModuleDir } = await import('./bridge.js')
+  const dir = '/data/user/0/com.example/files/adb_modules/keyforge'
+  await withShizuku(
+    {
+      getModuleInfo: () => JSON.stringify({ id: 'keyforge', moduleDir: dir }),
+      exec: () => '{}',
+    },
+    async () => {
+      assert.equal(shizukuModuleDir(), dir)
+      assert.equal(
+        buildScriptCommand(['status'], false),
+        `sh '${dir}/keyforge.sh' 'status'`,
+      )
+      // Explicit AxManager routing still wins when forced.
+      assert.match(buildScriptCommand(['status'], true), /axeron\/plugins/)
+    },
+  )
+  await withShizuku(
+    {
+      getModuleInfo: () => {
+        throw new Error('denied')
+      },
+      exec: () => '{}',
+    },
+    async () => {
+      assert.equal(shizukuModuleDir(), null)
+      assert.match(buildScriptCommand(['status'], false), /\/data\/adb\/modules\/keyforge/)
+    },
+  )
+  await withShizuku(undefined, async () => {
+    assert.equal(shizukuModuleDir(), null)
+  })
+})

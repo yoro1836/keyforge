@@ -34,16 +34,60 @@ export function escapeAxManagerCommand(command) {
 export function isAxManagerBridge() {
   return Boolean(globalThis.Axeron && typeof globalThis.Axeron.exec === 'function')
 }
+export function isShizukuBridge() {
+  return Boolean(globalThis.Shizuku && typeof globalThis.Shizuku.exec === 'function')
+}
+
+export function shizukuModuleDir() {
+  try {
+    if (!isShizukuBridge() || typeof globalThis.Shizuku.getModuleInfo !== 'function') return null
+    const info = JSON.parse(globalThis.Shizuku.getModuleInfo())
+    return typeof info?.moduleDir === 'string' && info.moduleDir ? info.moduleDir : null
+  } catch {
+    return null
+  }
+}
+
 
 export function hasCommandBridge() {
   return Boolean(
-    isAxManagerBridge() ||
+    isShizukuBridge() ||
+      isAxManagerBridge() ||
       (globalThis.kernelsu && typeof globalThis.kernelsu.exec === 'function') ||
       (globalThis.ksu && typeof globalThis.ksu.exec === 'function'),
   )
 }
+export function parseShizukuResult(raw) {
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      return { ok: true, exitCode: 0, stdout: raw, stderr: '', timedOut: false }
+    }
+  }
+  if (raw && typeof raw === 'object') {
+    const timedOut = raw.timedOut === true
+    const ok = raw.ok === true && !timedOut
+    return {
+      ok,
+      exitCode: Number(raw.exitCode ?? (ok ? 0 : 1)),
+      stdout: String(raw.stdout ?? ''),
+      stderr: timedOut && !raw.stderr ? 'Command timed out' : String(raw.stderr ?? ''),
+      timedOut,
+    }
+  }
+  return { ok: false, exitCode: 1, stdout: '', stderr: 'Empty shell result', timedOut: false }
+}
 
 export async function execRoot(command) {
+  if (isShizukuBridge()) {
+    // shevery API: exec returns JSON {ok, exitCode, stdout, stderr, timedOut}.
+    const parsed = parseShizukuResult(await globalThis.Shizuku.exec(command))
+    if (!parsed.ok) {
+      throw new Error(parsed.stderr || `Command failed with code ${parsed.exitCode}`)
+    }
+    return parsed.stdout
+  }
   let raw
   if (globalThis.kernelsu && typeof globalThis.kernelsu.exec === 'function') {
     raw = await globalThis.kernelsu.exec(command)
@@ -57,7 +101,7 @@ export async function execRoot(command) {
       raw = response
     }
   } else {
-    throw new Error('WebUI command bridge unavailable. Open this page from AX Manager or KernelSU.')
+    throw new Error('WebUI command bridge unavailable. Open this page from AX Manager, KernelSU, or shevery.')
   }
 
   const result = normalizeResult(raw)
@@ -72,6 +116,12 @@ export function buildScriptCommand(args, axManager = isAxManagerBridge()) {
   const missing = `echo 'KeyForge module script not found' >&2; exit 127`
 
   if (!axManager) {
+    // Shizuku installs modules under app-private storage; the module dir
+    // from getModuleInfo() is authoritative there, /data/adb is not.
+    const shizukuDir = shizukuModuleDir()
+    if (shizukuDir) {
+      return `sh ${shellQuote(`${shizukuDir}/keyforge.sh`)}${suffix}`
+    }
     return `if [ -f ${ROOT_MODULE_SCRIPT} ]; then sh ${ROOT_MODULE_SCRIPT}${suffix}; else ${missing}; fi`
   }
 

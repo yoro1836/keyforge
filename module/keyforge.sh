@@ -47,6 +47,8 @@ detect_framework() {
         echo "kernelsu"
     elif [ -n "${MAGISK_VER_CODE:-}" ] || [ -x /data/adb/magisk/busybox ]; then
         echo "magisk"
+    elif [ -n "${SHIZUKU_MODULE_ID:-}" ]; then
+        echo "shizuku"
     elif [ -d /data/user_de/0/com.android.shell/axeron ] || \
          [ -d /data/user_de/0/android/axeron ]; then
         echo "axmanager"
@@ -58,6 +60,8 @@ detect_framework() {
 supports_device_hide() {
     case "$(detect_framework)" in
         kernelsu|magisk) return 0 ;;
+        # Shizuku runs scripts as ADB shell or root; hiding needs root.
+        shizuku) [ "$(id -u 2>/dev/null)" = "0" ] ;;
         *) return 1 ;;
     esac
 }
@@ -263,7 +267,7 @@ case "${1:-}" in
         case "${2:-status}" in
             on)
                 if ! supports_device_hide; then
-                    echo "keyforge: device hiding requires KernelSU or Magisk" >&2
+                    echo "keyforge: device hiding requires root (KernelSU, Magisk, or root shevery)" >&2
                     exit 2
                 fi
                 config_set HIDE_DEVICE 1 || exit $?

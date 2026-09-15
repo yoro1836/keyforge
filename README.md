@@ -3,7 +3,7 @@
 Lua-scriptable input automation for rooted Android. Intercept, transform, and emit
 evdev events at the kernel boundary — any key, any axis, any device.
 
-KeyForge ships as one module ZIP for AX Manager, KernelSU, and Magisk, with
+KeyForge ships as one module ZIP for AX Manager, KernelSU, Magisk, and shevery, with
 direct access to `/dev/input`.
 
 ## How It Works
@@ -22,7 +22,7 @@ direct access to `/dev/input`.
 - **Vue WebUI** — offline Vue 3 interface with a Material 3 Expressive design
 - **Hot reload** — config changes detected within 500ms, no restart needed
 - **Per-plugin config** — settings saved to `/sdcard/.keyforge/configs/<id>.conf`
-- **Cross-manager module** — one ZIP supports AX Manager, KernelSU, and Magisk
+- **Cross-manager module** — one ZIP supports AX Manager, KernelSU, Magisk, and shevery (Shizuku ADB modules)
 
 ## Install
 
@@ -42,9 +42,19 @@ compatible Magisk module WebUI client; all configuration remains in the same UI.
 1. Import the same module ZIP in AX Manager.
 2. Start the module, open its WebUI, and select a controller.
 
+### shevery (Shizuku ADB modules)
+
+1. Install the same module ZIP in shevery.
+2. The WebUI talks through the Shizuku shell bridge (`usesShellBridge=true`);
+   no remote assets are loaded.
+3. In ADB-shell mode the daemon runs unprivileged (no `/dev/input` access,
+   no device hiding); in root mode everything works and device hiding is
+   available. Deleting the module makes the running daemon restore the
+   physical device and exit by itself.
+
 ## Physical-device hiding
 
-On KernelSU or Magisk, use the WebUI for the complete flow. The card is omitted
+On KernelSU, Magisk, or root shevery, use the WebUI for the complete flow. The card is omitted
 entirely in AX Manager because its ADB-level plugin environment must not rename
 or remove `/dev/input` nodes.
 
@@ -121,7 +131,7 @@ automatically. Supported kinds: `"toggle"`, `"permille"` (0-1000‰ with slider)
 ## Structure
 
 ```
-module/            Installable AX Manager / KernelSU / Magisk module
+module/            Installable AX Manager / KernelSU / Magisk / shevery module
   keyforge.sh      Control script and manager/runtime detection
   customize.sh     KernelSU/Magisk installer permissions and ABI check
   service.sh       Boot entry: daemon start plus detached request supervisor
