@@ -2,6 +2,7 @@ mod config;
 mod core;
 mod pipeline;
 mod plugin;
+mod uhid;
 
 use config::Config;
 use core::*;

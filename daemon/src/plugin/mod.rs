@@ -189,6 +189,7 @@ pub fn load_plugins(
     order: &[String],
 ) -> Vec<PluginMeta> {
     let mut metas = Vec::new();
+    let _ = crate::uhid::register_uh(lua);
     let dir = match fs::read_dir(plugin_dir) {
         Ok(d) => d,
         Err(_) => {
