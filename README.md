@@ -47,7 +47,12 @@ compatible Magisk module WebUI client; all configuration remains in the same UI.
 1. Install the same module ZIP in shevery.
 2. The WebUI talks through the Shizuku shell bridge (`usesShellBridge=true`);
    no remote assets are loaded.
-3. In ADB-shell mode the daemon runs with shell privileges: `/dev/input`
+3. Shell contexts cannot read app-private module files, so the runtime lives
+   at the fixed path `/data/local/tmp/keyforge`: on each service run it is
+   bootstrapped from the newest `keyforge` ZIP in Download (or synced when
+   readable), and the running daemon keeps its own binary fresh there.
+   The WebUI, `service.sh`, and `action.sh` all use that path.
+4. In ADB-shell mode the daemon runs with shell privileges: `/dev/input`
    grab and `/dev/uhid` device creation work where the shell user belongs to
    the `input`/`uhid` groups, but device hiding needs root. In root mode
    everything works. Deleting the module makes the running daemon restore

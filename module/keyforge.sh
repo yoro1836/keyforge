@@ -1,7 +1,21 @@
 #!/system/bin/sh
 # KeyForge control script for WebUI and module management.
 
-MODDIR="${0%/*}"
+SHADOW_DIR="${KEYFORGE_SHADOW_DIR:-/data/local/tmp/keyforge}"
+
+# Resolve the runtime home. Content-runners (shevery service/action) invoke
+# scripts as `sh -c`, where $0 is "sh", so prefer the script's own directory,
+# then the staged copy, then the environment.
+resolve_moddir() {
+    if [ -f "${0%/*}/keyforge.sh" ]; then
+        printf '%s' "${0%/*}"
+    elif [ -f "$SHADOW_DIR/keyforge.sh" ]; then
+        printf '%s' "$SHADOW_DIR"
+    else
+        printf '%s' "${MODDIR:-${0%/*}}"
+    fi
+}
+MODDIR="$(resolve_moddir)"
 BIN="$MODDIR/keyforge"
 CONF="$MODDIR/keyforge.conf"
 PIDFILE="$MODDIR/keyforge.pid"

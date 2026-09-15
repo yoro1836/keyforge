@@ -12,6 +12,8 @@ use pipeline::{EmitEvent, Event, Pipeline, Side};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,60 @@ fn runtime_dir() -> PathBuf {
         PathBuf::from("/data/local/tmp")
     } else {
         env::temp_dir()
+    }
+}
+
+/// Fixed shell-readable home for the daemon binary. The module directory is
+/// unreadable from shell contexts (shevery ADB mode), so the daemon keeps a
+/// fresh copy of itself here; service.sh and the WebUI use this fixed path.
+fn shadow_dir() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("KEYFORGE_SHADOW_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    if cfg!(target_os = "android") {
+        return Some(PathBuf::from("/data/local/tmp/keyforge"));
+    }
+    None
+}
+
+/// Copy `current` to `dir/keyforge` when missing or stale. Best-effort.
+fn stage_binary(current: &Path, dir: &Path) -> bool {
+    let dest = dir.join("keyforge");
+    let stale = match (fs::metadata(current), fs::metadata(&dest)) {
+        (Ok(src), Ok(dst)) => src.len() != dst.len() || src.modified().ok() > dst.modified().ok(),
+        (Ok(_), Err(_)) => true,
+        _ => return false,
+    };
+    if !stale {
+        return false;
+    }
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let tmp = dir.join(".keyforge.stage");
+    if fs::copy(current, &tmp).is_err() {
+        return false;
+    }
+    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755));
+    if fs::rename(&tmp, &dest).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+/// Keep the staged copy fresh. Runs once at startup, before detaching.
+fn ensure_staged() {
+    let (Some(dir), Ok(current)) = (shadow_dir(), env::current_exe()) else {
+        return;
+    };
+    if current.parent() == Some(dir.as_path()) {
+        return;
+    }
+    if stage_binary(&current, &dir) {
+        eprintln!("keyforge: staged runtime binary at {}", dir.display());
     }
 }
 
@@ -107,6 +163,7 @@ fn main() {
         .parent()
         .map(|parent| parent.join("module.prop"));
     let module_managed = module_prop.as_deref().is_some_and(|prop| prop.exists());
+    ensure_staged();
 
     // Detach from the caller (double fork, like encored) so the daemon always
     // ends up owned by init — never by a WebUI app or any short-lived shell.
@@ -613,4 +670,35 @@ fn process_stick(
         out.abs(code_y, e.y());
     }
     flush_emits(pctx, out, &emits);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn stage_binary_copies_once_then_detects_fresh() {
+        let dir = std::env::temp_dir().join(format!("keyforge-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src-bin");
+        fs::write(&src, b"0123456789").unwrap();
+
+        let dest_dir = dir.join("shadow");
+        assert!(stage_binary(&src, &dest_dir));
+        let dest = dest_dir.join("keyforge");
+        assert_eq!(fs::read(&dest).unwrap(), b"0123456789");
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!stage_binary(&src, &dest_dir));
+
+        fs::write(&src, b"0123456789!").unwrap();
+        assert!(stage_binary(&src, &dest_dir));
+        assert_eq!(fs::read(&dest).unwrap(), b"0123456789!");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

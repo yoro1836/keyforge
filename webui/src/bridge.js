@@ -1,5 +1,6 @@
 import { exec as kernelSuExec, toast as kernelSuToast } from 'kernelsu'
 
+const STAGED_SCRIPT = '/data/local/tmp/keyforge/keyforge.sh'
 const ROOT_MODULE_SCRIPT = '/data/adb/modules/keyforge/keyforge.sh'
 const AX_MODULE_SCRIPTS = [
   '/data/user_de/0/com.android.shell/axeron/plugins/keyforge/keyforge.sh',
@@ -37,17 +38,6 @@ export function isAxManagerBridge() {
 export function isShizukuBridge() {
   return Boolean(globalThis.Shizuku && typeof globalThis.Shizuku.exec === 'function')
 }
-
-export function shizukuModuleDir() {
-  try {
-    if (!isShizukuBridge() || typeof globalThis.Shizuku.getModuleInfo !== 'function') return null
-    const info = JSON.parse(globalThis.Shizuku.getModuleInfo())
-    return typeof info?.moduleDir === 'string' && info.moduleDir ? info.moduleDir : null
-  } catch {
-    return null
-  }
-}
-
 
 export function hasCommandBridge() {
   return Boolean(
@@ -115,13 +105,12 @@ export function buildScriptCommand(args, axManager = isAxManagerBridge()) {
   const suffix = args.length ? ` ${args.map(shellQuote).join(' ')}` : ''
   const missing = `echo 'KeyForge module script not found' >&2; exit 127`
 
+  if (!axManager && isShizukuBridge()) {
+    // The module directory is unreadable from shell contexts, so the daemon
+    // keeps a staged copy of the runtime here (see service.sh bootstrap).
+    return `sh ${STAGED_SCRIPT}${suffix}`
+  }
   if (!axManager) {
-    // Shizuku installs modules under app-private storage; the module dir
-    // from getModuleInfo() is authoritative there, /data/adb is not.
-    const shizukuDir = shizukuModuleDir()
-    if (shizukuDir) {
-      return `sh ${shellQuote(`${shizukuDir}/keyforge.sh`)}${suffix}`
-    }
     return `if [ -f ${ROOT_MODULE_SCRIPT} ]; then sh ${ROOT_MODULE_SCRIPT}${suffix}; else ${missing}; fi`
   }
 

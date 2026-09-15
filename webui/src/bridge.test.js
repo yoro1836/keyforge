@@ -147,37 +147,19 @@ test('Shizuku bridge executes and reports errors', async () => {
   )
 })
 
-test('buildScriptCommand prefers the Shizuku module directory', async () => {
-  const { buildScriptCommand, shizukuModuleDir } = await import('./bridge.js')
-  const dir = '/data/user/0/com.example/files/adb_modules/keyforge'
+test('buildScriptCommand uses the staged runtime under Shizuku', async () => {
+  const { buildScriptCommand } = await import('./bridge.js')
   await withShizuku(
     {
-      getModuleInfo: () => JSON.stringify({ id: 'keyforge', moduleDir: dir }),
       exec: () => '{}',
     },
     async () => {
-      assert.equal(shizukuModuleDir(), dir)
       assert.equal(
         buildScriptCommand(['status'], false),
-        `sh '${dir}/keyforge.sh' 'status'`,
+        `sh /data/local/tmp/keyforge/keyforge.sh 'status'`,
       )
       // Explicit AxManager routing still wins when forced.
       assert.match(buildScriptCommand(['status'], true), /axeron\/plugins/)
     },
   )
-  await withShizuku(
-    {
-      getModuleInfo: () => {
-        throw new Error('denied')
-      },
-      exec: () => '{}',
-    },
-    async () => {
-      assert.equal(shizukuModuleDir(), null)
-      assert.match(buildScriptCommand(['status'], false), /\/data\/adb\/modules\/keyforge/)
-    },
-  )
-  await withShizuku(undefined, async () => {
-    assert.equal(shizukuModuleDir(), null)
-  })
 })
