@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { hasCommandBridge, nativeToast, runScript } from './bridge.js'
+import { ensureSheveryRuntime, hasCommandBridge, isShizukuBridge, nativeToast, runScript } from './bridge.js'
 
 const KEY_PATTERN = /^[A-Za-z0-9._-]+$/
 
@@ -134,6 +134,17 @@ async function refreshAll({ quiet = false } = {}) {
     initialLoading.value = false
     return
   }
+  if (isShizukuBridge()) {
+    try {
+      const prepared = await ensureSheveryRuntime()
+      if (prepared.staged) showMessage('Runtime ready')
+    } catch (error) {
+      bridgeError.value = error instanceof Error ? error.message : String(error)
+      initialLoading.value = false
+      return
+    }
+  }
+
 
   refreshing.value = !quiet
   bridgeError.value = ''

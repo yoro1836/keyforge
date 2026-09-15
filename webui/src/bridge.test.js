@@ -163,3 +163,86 @@ test('buildScriptCommand uses the staged runtime under Shizuku', async () => {
     },
   )
 })
+
+test('base64Chunks round-trips binary data', async () => {
+  const { base64Chunks } = await import('./bridge.js')
+  const bytes = new Uint8Array([0, 1, 2, 250, 255, 65, 66, 67])
+  const joined = base64Chunks(bytes, 4).join('')
+  assert.equal(Buffer.from(joined, 'base64').toString('hex'), Buffer.from(bytes).toString('hex'))
+  assert.deepEqual(base64Chunks(new Uint8Array(0)), [])
+  const many = base64Chunks(new Uint8Array(100).fill(7), 10)
+  assert.ok(many.length > 1)
+  assert.ok(many.every((chunk) => chunk.length <= 10))
+})
+
+test('fetchModuleFile reports trust problems clearly', async () => {
+  const { fetchModuleFile } = await import('./bridge.js')
+  const previousFetch = globalThis.fetch
+  try {
+    globalThis.fetch = async () => ({
+      ok: true, status: 200, text: async () => 'script-body', arrayBuffer: async () => new Uint8Array([9]).buffer,
+    })
+    assert.equal(await fetchModuleFile('../keyforge.sh', { baseHref: 'file:///m/webroot/index.html' }), 'script-body')
+    const binary = await fetchModuleFile('../keyforge', { binary: true, baseHref: 'file:///m/webroot/index.html' })
+    assert.ok(binary instanceof Uint8Array)
+    assert.equal(binary[0], 9)
+    globalThis.fetch = async () => ({ ok: false, status: 404 })
+    await assert.rejects(fetchModuleFile('../x', { baseHref: 'file:///m/' }), /HTTP 404/)
+    globalThis.fetch = async () => { throw new TypeError('Failed to fetch') }
+    await assert.rejects(fetchModuleFile('../x', { baseHref: 'file:///m/' }), /Full Trust/)
+  } finally {
+    if (previousFetch === undefined) delete globalThis.fetch
+    else globalThis.fetch = previousFetch
+  }
+})
+
+test('ensureSheveryRuntime stages once then skips', async () => {
+  const { ensureSheveryRuntime } = await import('./bridge.js')
+  const previousFetch = globalThis.fetch
+  const calls = []
+  const shizuku = {
+    getModuleInfo: () => JSON.stringify({ id: 'keyforge', version: 'v0-test' }),
+    exec: (command) => {
+      calls.push({ command, stdin: null })
+      if (command.startsWith('cat ')) {
+        return JSON.stringify({ ok: false, exitCode: 1, stdout: '', stderr: 'missing', timedOut: false })
+      }
+      return JSON.stringify({ ok: true, exitCode: 0, stdout: '', stderr: '', timedOut: false })
+    },
+    execWithOptions: (command, options) => {
+      calls.push({ command, stdin: JSON.parse(options).stdin })
+      return JSON.stringify({ ok: true, exitCode: 0, stdout: '', stderr: '', timedOut: false })
+    },
+  }
+  globalThis.fetch = async (url) => {
+    const path = String(url)
+    if (path.endsWith('/keyforge.sh')) {
+      return { ok: true, status: 200, text: async () => '#!/system/bin/sh\necho hi\n' }
+    }
+    return { ok: true, status: 200, arrayBuffer: async () => new TextEncoder().encode('FAKE-BINARY').buffer }
+  }
+  try {
+    await withShizuku(shizuku, async () => {
+      const first = await ensureSheveryRuntime({ baseHref: 'file:///m/webroot/index.html' })
+      assert.equal(first.staged, true)
+      const writes = calls.filter((call) => call.stdin !== null)
+      assert.ok(writes.length >= 2)
+      assert.match(writes[0].command, /> \/data\/local\/tmp\/keyforge\/keyforge\.sh$/)
+      assert.ok(calls.some((call) => /chmod 755 \/data\/local\/tmp\/keyforge\/keyforge$/.test(call.command)))
+      assert.ok(calls.some((call) => call.command.includes('.version')))
+      // Second run sees the staged version and performs no writes.
+      calls.length = 0
+      shizuku.exec = (command) => JSON.stringify({
+        ok: true, exitCode: 0,
+        stdout: command.startsWith('cat ') ? 'v0-test\n' : '',
+        stderr: '', timedOut: false,
+      })
+      const second = await ensureSheveryRuntime({ baseHref: 'file:///m/webroot/index.html' })
+      assert.equal(second.staged, false)
+      assert.ok(calls.every((call) => call.stdin === null))
+    })
+  } finally {
+    if (previousFetch === undefined) delete globalThis.fetch
+    else globalThis.fetch = previousFetch
+  }
+})
